@@ -1,0 +1,23 @@
+{
+    "active_account_index": 0,
+    "current_server_id": null,
+    "ftp_password": "votre_mot_de_passe_ftp_partagé",
+    "accounts": [
+        {
+            "email": "compte1@example.com",
+            "password": "password1",
+            "cookies": {},
+            "ftp_host": null,
+            "ftp_user": null,
+            "server_id": null
+        },
+        {
+            "email": "compte2@example.com",
+            "password": "password2",
+            "cookies": {},
+            "ftp_host": null,
+            "ftp_user": null,
+            "server_id": null
+        }
+    ]
+}
