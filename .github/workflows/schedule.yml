@@ -1,0 +1,38 @@
+name: Rotation Serveur Minecraft
+
+on:
+  schedule:
+    # Lance le script à 00:00, 08:00 et 16:00 UTC
+    - cron: "0 0,8,16 * * *"
+  workflow_dispatch: # Permet de lancer manuellement pour tester
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v3
+
+      - name: Installation de Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Installation des dépendances système
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lftp firefox
+
+      - name: Installation des librairies Python
+        run: |
+          pip install -r requirements.txt
+
+      - name: Exécution du Worker
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          # Mettez ici le nom de sous-domaine souhaité (ex: orny)
+          IP_NEW_SERVER: "orny"
+        run: python worker.py
