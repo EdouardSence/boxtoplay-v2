@@ -1,20 +1,24 @@
 {
     "active_account_index": 0,
-    "current_server_id": null,
-    "ftp_password": "votre_mot_de_passe_ftp_partagé",
+    "current_server_id": "123456",
+    "ftp_password": "Password123",
     "accounts": [
         {
             "email": "compte1@example.com",
-            "password": "password1",
-            "cookies": {},
-            "ftp_host": null,
-            "ftp_user": null,
-            "server_id": null
+            "password": "MotDePasse1",
+            "cookies": {
+                "BOXTOPLAY_SESSION": "xxxxxxxxxxxxx-YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+            },
+            "ftp_host": "ftp.mc-1-123456.boxtoplay.com",
+            "ftp_user": "user_1737136800",
+            "server_id": "123456"
         },
         {
             "email": "compte2@example.com",
-            "password": "password2",
-            "cookies": {},
+            "password": "MotDePasse2",
+            "cookies": {
+                "BOXTOPLAY_SESSION": "xxxxxxxxxxxxx-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+            },
             "ftp_host": null,
             "ftp_user": null,
             "server_id": null

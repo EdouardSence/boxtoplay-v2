@@ -158,25 +158,131 @@ def get_state() -> dict:
     return state
 
 
-def update_state(new_state: dict) -> None:
+def validate_server_info(server_id: str, ftp_host: str, ftp_user: str) -> bool:
+    """
+    Valide que les informations du serveur sont correctes avant sauvegarde.
+    
+    Args:
+        server_id: ID du serveur (doit être numérique)
+        ftp_host: Hôte FTP (doit contenir 'boxtoplay')
+        ftp_user: Utilisateur FTP (ne doit pas être vide)
+        
+    Returns:
+        bool: True si toutes les validations passent
+    """
+    errors = []
+    
+    # Validation server_id
+    if not server_id:
+        errors.append("server_id est vide ou None")
+    elif not str(server_id).isdigit():
+        errors.append(f"server_id '{server_id}' n'est pas un nombre valide")
+    
+    # Validation ftp_host
+    if not ftp_host:
+        errors.append("ftp_host est vide ou None")
+    elif "boxtoplay" not in ftp_host.lower() and "." not in ftp_host:
+        errors.append(f"ftp_host '{ftp_host}' semble invalide")
+    
+    # Validation ftp_user
+    if not ftp_user:
+        errors.append("ftp_user est vide ou None")
+    elif len(ftp_user) < 3:
+        errors.append(f"ftp_user '{ftp_user}' est trop court")
+    
+    if errors:
+        for error in errors:
+            logger.error(f"❌ Validation échouée: {error}")
+        return False
+    
+    logger.info(f"✅ Validation réussie: server={server_id}, host={ftp_host}, user={ftp_user}")
+    return True
+
+
+def validate_state_before_save(state: dict, target_index: int) -> bool:
+    """
+    Vérifie que l'état est cohérent avant de le sauvegarder dans le Gist.
+    
+    Args:
+        state: État complet à valider
+        target_index: Index du compte cible (celui qu'on vient d'activer)
+        
+    Returns:
+        bool: True si l'état est valide
+    """
+    errors = []
+    
+    # Vérification structure de base
+    if "accounts" not in state or len(state["accounts"]) != 2:
+        errors.append("Structure 'accounts' invalide")
+        return False
+    
+    if "active_account_index" not in state:
+        errors.append("'active_account_index' manquant")
+    elif state["active_account_index"] not in [0, 1]:
+        errors.append(f"'active_account_index' invalide: {state['active_account_index']}")
+    
+    # Vérification current_server_id
+    if "current_server_id" not in state:
+        errors.append("'current_server_id' manquant")
+    elif state["current_server_id"] and not str(state["current_server_id"]).isdigit():
+        errors.append(f"'current_server_id' invalide: {state['current_server_id']}")
+    
+    # Vérification du compte cible (doit avoir toutes les infos)
+    target_account = state["accounts"][target_index]
+    
+    if not target_account.get("server_id"):
+        errors.append(f"Compte {target_index}: 'server_id' manquant")
+    
+    if not target_account.get("ftp_host"):
+        errors.append(f"Compte {target_index}: 'ftp_host' manquant")
+    
+    if not target_account.get("ftp_user"):
+        errors.append(f"Compte {target_index}: 'ftp_user' manquant")
+    
+    if not target_account.get("cookies") or not target_account["cookies"].get("BOXTOPLAY_SESSION"):
+        errors.append(f"Compte {target_index}: 'cookies' invalides")
+    
+    # Cohérence: current_server_id doit correspondre au serveur du compte actif
+    if state.get("current_server_id") and target_account.get("server_id"):
+        if str(state["current_server_id"]) != str(target_account["server_id"]):
+            errors.append(f"Incohérence: current_server_id ({state['current_server_id']}) != account[{target_index}].server_id ({target_account['server_id']})")
+    
+    if errors:
+        for error in errors:
+            logger.error(f"❌ Validation état: {error}")
+        return False
+    
+    logger.info("✅ État validé avec succès")
+    return True
+
+
+def update_state(new_state: dict, target_index: int = None) -> None:
     """
     [GIST PATCH] Sauvegarde le nouvel état dans le Gist GitHub.
     
     Cette fonction est appelée à la fin du script pour persister:
     - Le nouvel active_account_index
     - Les nouveaux cookies de session
-    - Les nouvelles infos FTP
-    - L'ID du nouveau serveur
+    - Les nouvelles infos FTP (ftp_host, ftp_user)
+    - L'ID du nouveau serveur (server_id et current_server_id)
     
     Args:
         new_state: État complet à sauvegarder
+        target_index: Index du compte cible pour validation (optionnel)
         
     Raises:
         ValueError: Si GIST_ID ou GH_TOKEN non définis
+        ValueError: Si validation échoue
         requests.HTTPError: Si erreur API GitHub
     """
     if not GIST_ID or not GH_TOKEN:
         raise ValueError("❌ GIST_ID et GH_TOKEN doivent être définis!")
+    
+    # Validation avant sauvegarde (si target_index fourni)
+    if target_index is not None:
+        if not validate_state_before_save(new_state, target_index):
+            raise ValueError("❌ Validation de l'état échouée, sauvegarde annulée!")
     
     headers = {
         "Authorization": f"token {GH_TOKEN}",
@@ -199,7 +305,13 @@ def update_state(new_state: dict) -> None:
     )
     response.raise_for_status()
     
-    logger.info("📤 État sauvegardé dans le Gist avec succès")
+    # Log des infos sauvegardées
+    logger.info("📤 État sauvegardé dans le Gist:")
+    logger.info(f"   - active_account_index: {new_state.get('active_account_index')}")
+    logger.info(f"   - current_server_id: {new_state.get('current_server_id')}")
+    if target_index is not None:
+        acc = new_state["accounts"][target_index]
+        logger.info(f"   - Compte {target_index}: server_id={acc.get('server_id')}, ftp_host={acc.get('ftp_host')}, ftp_user={acc.get('ftp_user')}")
 
 
 # =============================================================================
@@ -875,14 +987,47 @@ def process_target_account(driver: webdriver.Firefox, account: dict, ftp_passwor
     # Récupère les cookies frais (pour le bot Discord)
     fresh_cookies = get_all_cookies(driver)
     
+    # =========================================
+    # VALIDATION DES DONNÉES AVANT RETOUR
+    # =========================================
+    logger.info("🔍 Validation des informations récupérées...")
+    
+    # Vérifier server_id
+    if not server_id or not str(server_id).isdigit():
+        raise ValueError(f"server_id invalide: '{server_id}'")
+    
+    # Vérifier ftp_host
+    if not ftp_info.get("host") or len(ftp_info["host"]) < 5:
+        raise ValueError(f"ftp_host invalide: '{ftp_info.get('host')}'")
+    
+    # Vérifier ftp_user
+    if not ftp_info.get("user") or len(ftp_info["user"]) < 3:
+        raise ValueError(f"ftp_user invalide: '{ftp_info.get('user')}'")
+    
+    # Vérifier cookies
+    if not fresh_cookies.get("BOXTOPLAY_SESSION"):
+        logger.warning("⚠️ Cookie BOXTOPLAY_SESSION non trouvé, tentative de récupération...")
+        # Réessayer la récupération des cookies
+        driver.get("https://www.boxtoplay.com/panel")
+        time.sleep(2)
+        fresh_cookies = get_all_cookies(driver)
+        
+        if not fresh_cookies.get("BOXTOPLAY_SESSION"):
+            raise ValueError("Cookie BOXTOPLAY_SESSION introuvable après retry")
+    
+    # Validation globale
+    if not validate_server_info(server_id, ftp_info["host"], ftp_info["user"]):
+        raise ValueError("Validation des informations serveur échouée")
+    
     result = {
-        "server_id": server_id,
+        "server_id": str(server_id),  # Toujours en string
         "ftp_host": ftp_info["host"],
         "ftp_user": ftp_info["user"],
         "ftp_password": ftp_password,
         "cookies": fresh_cookies
     }
     
+    logger.info(f"✅ Infos serveur validées: #{server_id} @ {ftp_info['host']}")
     return result
 
 
@@ -1007,19 +1152,38 @@ def main():
         # =================================================================
         logger.info("\n💾 ÉTAPE 6: Sauvegarde de l'état")
         
-        # Mise à jour de l'état
+        # Vérification que les données à sauvegarder sont valides
+        logger.info("🔍 Vérification des données avant sauvegarde...")
+        
+        if not target_result.get("server_id"):
+            raise ValueError("❌ Impossible de sauvegarder: server_id manquant!")
+        if not target_result.get("ftp_host"):
+            raise ValueError("❌ Impossible de sauvegarder: ftp_host manquant!")
+        if not target_result.get("ftp_user"):
+            raise ValueError("❌ Impossible de sauvegarder: ftp_user manquant!")
+        if not target_result.get("cookies", {}).get("BOXTOPLAY_SESSION"):
+            raise ValueError("❌ Impossible de sauvegarder: cookies manquants!")
+        
+        # Mise à jour de l'état global
         state["active_account_index"] = next_index
-        state["current_server_id"] = target_result["server_id"]
+        state["current_server_id"] = str(target_result["server_id"])  # Toujours string
         
-        # Mise à jour du compte cible
-        state["accounts"][next_index].update({
-            "cookies": target_result["cookies"],
-            "ftp_host": target_result["ftp_host"],
-            "ftp_user": target_result["ftp_user"],
-            "server_id": target_result["server_id"]
-        })
+        # Mise à jour du compte cible avec les nouvelles infos
+        state["accounts"][next_index]["cookies"] = target_result["cookies"]
+        state["accounts"][next_index]["ftp_host"] = target_result["ftp_host"]
+        state["accounts"][next_index]["ftp_user"] = target_result["ftp_user"]
+        state["accounts"][next_index]["server_id"] = str(target_result["server_id"])
         
-        update_state(state)
+        # Log des changements
+        logger.info(f"📝 Nouvelles valeurs à sauvegarder:")
+        logger.info(f"   - active_account_index: {current_index} → {next_index}")
+        logger.info(f"   - current_server_id: {state.get('current_server_id')}")
+        logger.info(f"   - accounts[{next_index}].server_id: {target_result['server_id']}")
+        logger.info(f"   - accounts[{next_index}].ftp_host: {target_result['ftp_host']}")
+        logger.info(f"   - accounts[{next_index}].ftp_user: {target_result['ftp_user']}")
+        
+        # Sauvegarde avec validation
+        update_state(state, target_index=next_index)
         
         # =================================================================
         # TERMINÉ
