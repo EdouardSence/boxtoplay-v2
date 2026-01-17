@@ -19,10 +19,23 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Installation des dépendances système
+      # 1. On installe LFTP normalement
+      - name: Installation de LFTP
         run: |
           sudo apt-get update
-          sudo apt-get install -y lftp firefox
+          sudo apt-get install -y lftp
+
+      # 2. On installe Firefox via l'action officielle (Pour éviter le bug Snap)
+      - name: Setup Firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: "latest"
+
+      # 3. On installe Geckodriver (le pilote) explicitement
+      - name: Setup Geckodriver
+        uses: browser-actions/setup-geckodriver@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Installation des librairies Python
         run: |
@@ -33,6 +46,5 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          # Mettez ici le nom de sous-domaine souhaité (ex: orny)
           IP_NEW_SERVER: "orny"
         run: python worker.py
