@@ -22,7 +22,7 @@ CONFIGURATION (Variables d'environnement):
     - IP_NEW_SERVER: DNS du serveur (optionnel, défaut: "orny")
     - FTP_PASSWORD: Mot de passe FTP partagé (optionnel si dans le Gist)
 
-STRUCTURE DU GIST (boxtoplay_state.json):
+STRUCTURE DU GIST (boxtoplay.json):
 {
     "active_account_index": 0,
     "current_server_id": "123456",
@@ -151,7 +151,7 @@ def get_state() -> dict:
     response.raise_for_status()
     
     gist_data = response.json()
-    state_content = gist_data["files"]["boxtoplay_state.json"]["content"]
+    state_content = gist_data["files"]["boxtoplay.json"]["content"]
     state = json.loads(state_content)
     
     logger.info(f"📥 État récupéré - Compte actif: {state.get('active_account_index', 0)}")
@@ -185,7 +185,7 @@ def update_state(new_state: dict) -> None:
     
     payload = {
         "files": {
-            "boxtoplay_state.json": {
+            "boxtoplay.json": {
                 "content": json.dumps(new_state, indent=4, ensure_ascii=False)
             }
         }
