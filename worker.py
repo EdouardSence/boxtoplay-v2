@@ -1,1224 +1,345 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-BoxToPlay Worker - Version Cloud (GitHub Codespaces)
-================================================================================
-
-Script de migration automatique entre comptes BoxToPlay.
-Conçu pour tourner toutes les 8h sur GitHub Codespaces.
-
-ARCHITECTURE STATELESS:
-- Aucun fichier local persistant (pas de id.json, cookies.json)
-- État stocké dans un GitHub Gist (base de données)
-- Transferts FTP via /tmp (dossier temporaire)
-
-PRÉREQUIS:
-    pip install selenium requests
-    sudo apt-get install -y lftp firefox-esr
-
-CONFIGURATION (Variables d'environnement):
-    - GIST_ID: ID du Gist GitHub contenant l'état
-    - GH_TOKEN: Token GitHub avec permission "gist"
-    - IP_NEW_SERVER: DNS du serveur (optionnel, défaut: "orny")
-    - FTP_PASSWORD: Mot de passe FTP partagé (optionnel si dans le Gist)
-
-STRUCTURE DU GIST (boxtoplay.json):
-{
-    "active_account_index": 0,
-    "current_server_id": "123456",
-    "ftp_password": "motdepasse",
-    "accounts": [
-        {
-            "email": "compte1@example.com",
-            "password": "password1",
-            "cookies": {"BOXTOPLAY_SESSION": "..."},
-            "ftp_host": "ftp1.boxtoplay.com",
-            "ftp_user": "user_xxx",
-            "server_id": "123456"
-        },
-        {
-            "email": "compte2@example.com",
-            "password": "password2",
-            "cookies": {},
-            "ftp_host": null,
-            "ftp_user": null,
-            "server_id": null
-        }
-    ]
-}
-
+BoxToPlay Worker - Version HTTP (Requests + BeautifulSoup)
 ================================================================================
 """
 
-import traceback
-import shutil
-from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import time
-import json
 import os
-import subprocess
+import json
+import time
+import shutil
 import logging
 import requests
-from datetime import datetime, timedelta
-
+import subprocess
+import re
+from bs4 import BeautifulSoup
+from datetime import datetime
 
 # =============================================================================
-# CONFIGURATION VIA VARIABLES D'ENVIRONNEMENT
+# CONFIGURATION
 # =============================================================================
 
 GIST_ID = os.environ.get("GIST_ID", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 IP_NEW_SERVER = os.environ.get("IP_NEW_SERVER", "orny")
 FTP_PASSWORD = os.environ.get("FTP_PASSWORD", "")
-
-# User-Agent pour Selenium
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
-
-# Dossier temporaire pour les transferts FTP (utilise /tmp pour être stateless)
 TEMP_DIR = "/tmp/boxtoplay_transfer"
 
-
-# =============================================================================
-# CONFIGURATION DU LOGGING
-# =============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Console
-        logging.FileHandler("/tmp/worker.log", mode='w')  # Fichier temporaire
-    ]
-)
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# SÉLECTEURS CSS/XPATH POUR BOXTOPLAY
-# =============================================================================
-
-SELECTORS = {
-    "email_input": '//*[@id="emailLogin"]',
-    "password_input": '//*[@id="passwordLogin"]',
-    "login_button": '/html/body/div[1]/div[2]/form[1]/div[4]/div[2]/button',
-    "cookies_accept": '/html/body/div[1]/div/div[3]/button[1]',
-    "checkout": '//*[@id="livraisonBt"]',
-    "gcu": '/html/body/div[2]/div/div[10]/button[1]',
-    "add_ftp_account": '/html/body/div/div[2]/div[2]/div/div[2]/div[2]/div/a',
-    "ftp_password": '//*[@id="password"]',
-    "ftp_host": '/html/body/div/div[2]/div[2]/div/div[2]/div[1]/div/table/tbody/tr[2]/td[2]',
-    "ftp_submit": '/html/body/div[1]/div[2]/div[2]/div/div[3]/div/div/form/div[3]/button[2]',
+# Headers pour imiter un vrai navigateur
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://www.boxtoplay.com",
+    "Referer": "https://www.boxtoplay.com/panel"
 }
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # =============================================================================
-# GESTION DE L'ÉTAT VIA GITHUB GIST
+# SESSION HTTP
 # =============================================================================
 
-def get_state() -> dict:
-    """
-    [GIST GET] Récupère l'état actuel depuis le Gist GitHub.
+class BoxSession:
+    def __init__(self, cookies_dict=None):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        if cookies_dict:
+            # On nettoie le cookie s'il contient "BOXTOPLAY_SESSION="
+            if "BOXTOPLAY_SESSION" in cookies_dict:
+                val = cookies_dict["BOXTOPLAY_SESSION"]
+                if val.startswith("BOXTOPLAY_SESSION="):
+                    val = val.split("=")[1]
+                self.session.cookies.set("BOXTOPLAY_SESSION", val, domain="www.boxtoplay.com")
+
+    def is_logged_in(self):
+        """Vérifie si la session est active en tentant d'accéder au panel"""
+        r = self.session.get("https://www.boxtoplay.com/panel", allow_redirects=False)
+        # Si redirection (302) vers /login, c'est qu'on est déco
+        if r.status_code == 302 or "login" in r.headers.get("Location", ""):
+            return False
+        return r.status_code == 200
+
+# =============================================================================
+# GIST UTILS
+# =============================================================================
+
+def get_state():
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
+    files = r.json()["files"]
+    filename = list(files.keys())[0]
+    return json.loads(files[filename]["content"])
+
+def update_state(new_state):
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
+    filename = list(r.json()["files"].keys())[0]
+    payload = {"files": {filename: {"content": json.dumps(new_state, indent=4)}}}
+    requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
+    logger.info("💾 État sauvegardé dans le Gist.")
+
+# =============================================================================
+# ACTIONS BOXTOPLAY
+# =============================================================================
+
+def get_current_server_id(box: BoxSession):
+    """Récupère l'ID du serveur depuis le dashboard"""
+    r = box.session.get("https://www.boxtoplay.com/panel")
+    soup = BeautifulSoup(r.text, 'html.parser')
     
-    L'état contient:
-    - active_account_index: Index du compte actuellement actif (0 ou 1)
-    - accounts: Liste des deux comptes avec leurs infos
-    - current_server_id: ID du serveur en cours d'utilisation
-    
-    Returns:
-        dict: État complet depuis le Gist
+    # Cherche le lien qui ressemble à /minecraft/dashboard/12345
+    # Basé sur votre selecteur Selenium: .block h2 a strong
+    try:
+        blocks = soup.select('.block')
+        if not blocks: return None
         
-    Raises:
-        ValueError: Si GIST_ID ou GH_TOKEN non définis
-        requests.HTTPError: Si erreur API GitHub
-    """
-    if not GIST_ID or not GH_TOKEN:
-        raise ValueError("❌ GIST_ID et GH_TOKEN doivent être définis dans les variables d'environnement!")
-    
-    headers = {
-        "Authorization": f"token {GH_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    response = requests.get(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers=headers,
-        timeout=30
-    )
-    response.raise_for_status()
-    
-    gist_data = response.json()
-    state_content = gist_data["files"]["boxtoplay.json"]["content"]
-    state = json.loads(state_content)
-    
-    logger.info(f"📥 État récupéré - Compte actif: {state.get('active_account_index', 0)}")
-    return state
+        # On prend le dernier bloc (le plus récent)
+        last_block = blocks[-1]
+        link = last_block.select_one('h2 a strong')
+        if link:
+            # Le texte est "#12345", on retire le #
+            return link.text.replace('#', '').strip()
+    except Exception as e:
+        logger.error(f"Erreur parsing ID serveur: {e}")
+    return None
 
+def stop_server(box: BoxSession, server_id):
+    logger.info(f"⏹️ Arrêt du serveur {server_id}...")
+    # C'est un simple GET d'après votre script Selenium
+    box.session.get(f"https://www.boxtoplay.com/minecraft/stop/{server_id}")
 
-def validate_server_info(server_id: str, ftp_host: str, ftp_user: str) -> bool:
-    """
-    Valide que les informations du serveur sont correctes avant sauvegarde.
-    
-    Args:
-        server_id: ID du serveur (doit être numérique)
-        ftp_host: Hôte FTP (doit contenir 'boxtoplay')
-        ftp_user: Utilisateur FTP (ne doit pas être vide)
-        
-    Returns:
-        bool: True si toutes les validations passent
-    """
-    errors = []
-    
-    # Validation server_id
-    if not server_id:
-        errors.append("server_id est vide ou None")
-    elif not str(server_id).isdigit():
-        errors.append(f"server_id '{server_id}' n'est pas un nombre valide")
-    
-    # Validation ftp_host
-    if not ftp_host:
-        errors.append("ftp_host est vide ou None")
-    elif "boxtoplay" not in ftp_host.lower() and "." not in ftp_host:
-        errors.append(f"ftp_host '{ftp_host}' semble invalide")
-    
-    # Validation ftp_user
-    if not ftp_user:
-        errors.append("ftp_user est vide ou None")
-    elif len(ftp_user) < 3:
-        errors.append(f"ftp_user '{ftp_user}' est trop court")
-    
-    if errors:
-        for error in errors:
-            logger.error(f"❌ Validation échouée: {error}")
-        return False
-    
-    logger.info(f"✅ Validation réussie: server={server_id}, host={ftp_host}, user={ftp_user}")
-    return True
-
-
-def validate_state_before_save(state: dict, target_index: int) -> bool:
-    """
-    Vérifie que l'état est cohérent avant de le sauvegarder dans le Gist.
-    
-    Args:
-        state: État complet à valider
-        target_index: Index du compte cible (celui qu'on vient d'activer)
-        
-    Returns:
-        bool: True si l'état est valide
-    """
-    errors = []
-    
-    # Vérification structure de base
-    if "accounts" not in state or len(state["accounts"]) != 2:
-        errors.append("Structure 'accounts' invalide")
-        return False
-    
-    if "active_account_index" not in state:
-        errors.append("'active_account_index' manquant")
-    elif state["active_account_index"] not in [0, 1]:
-        errors.append(f"'active_account_index' invalide: {state['active_account_index']}")
-    
-    # Vérification current_server_id
-    if "current_server_id" not in state:
-        errors.append("'current_server_id' manquant")
-    elif state["current_server_id"] and not str(state["current_server_id"]).isdigit():
-        errors.append(f"'current_server_id' invalide: {state['current_server_id']}")
-    
-    # Vérification du compte cible (doit avoir toutes les infos)
-    target_account = state["accounts"][target_index]
-    
-    if not target_account.get("server_id"):
-        errors.append(f"Compte {target_index}: 'server_id' manquant")
-    
-    if not target_account.get("ftp_host"):
-        errors.append(f"Compte {target_index}: 'ftp_host' manquant")
-    
-    if not target_account.get("ftp_user"):
-        errors.append(f"Compte {target_index}: 'ftp_user' manquant")
-    
-    if not target_account.get("cookies") or not target_account["cookies"].get("BOXTOPLAY_SESSION"):
-        errors.append(f"Compte {target_index}: 'cookies' invalides")
-    
-    # Cohérence: current_server_id doit correspondre au serveur du compte actif
-    if state.get("current_server_id") and target_account.get("server_id"):
-        if str(state["current_server_id"]) != str(target_account["server_id"]):
-            errors.append(f"Incohérence: current_server_id ({state['current_server_id']}) != account[{target_index}].server_id ({target_account['server_id']})")
-    
-    if errors:
-        for error in errors:
-            logger.error(f"❌ Validation état: {error}")
-        return False
-    
-    logger.info("✅ État validé avec succès")
-    return True
-
-
-def update_state(new_state: dict, target_index: int = None) -> None:
-    """
-    [GIST PATCH] Sauvegarde le nouvel état dans le Gist GitHub.
-    
-    Cette fonction est appelée à la fin du script pour persister:
-    - Le nouvel active_account_index
-    - Les nouveaux cookies de session
-    - Les nouvelles infos FTP (ftp_host, ftp_user)
-    - L'ID du nouveau serveur (server_id et current_server_id)
-    
-    Args:
-        new_state: État complet à sauvegarder
-        target_index: Index du compte cible pour validation (optionnel)
-        
-    Raises:
-        ValueError: Si GIST_ID ou GH_TOKEN non définis
-        ValueError: Si validation échoue
-        requests.HTTPError: Si erreur API GitHub
-    """
-    if not GIST_ID or not GH_TOKEN:
-        raise ValueError("❌ GIST_ID et GH_TOKEN doivent être définis!")
-    
-    # Validation avant sauvegarde (si target_index fourni)
-    if target_index is not None:
-        if not validate_state_before_save(new_state, target_index):
-            raise ValueError("❌ Validation de l'état échouée, sauvegarde annulée!")
-    
-    headers = {
-        "Authorization": f"token {GH_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
+def change_dns(box: BoxSession, server_id, dns_name):
+    logger.info(f"🔗 Changement DNS vers '{dns_name}'...")
+    url = "https://www.boxtoplay.com/minecraft/setServerDNS"
     payload = {
-        "files": {
-            "boxtoplay.json": {
-                "content": json.dumps(new_state, indent=4, ensure_ascii=False)
-            }
-        }
+        "name": "",
+        "value": dns_name,
+        "pk": server_id
+    }
+    # Headers AJAX obligatoires pour cette requête
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+    }
+    box.session.post(url, data=payload, headers=headers)
+
+def buy_server_safe(box: BoxSession):
+    """
+    Tente d'acheter le serveur gratuit.
+    SECURITÉ : Vérifie le prix avant de valider.
+    """
+    logger.info("🛒 Tentative ajout au panier (Leviathan)...")
+    
+    # 1. Ajout au panier (GET avec forceDuree=0 pour tenter le gratuit)
+    # URL récupérée de vos logs : /fr/cart/ajoutPanier/12?forceDuree=0
+    box.session.get("https://www.boxtoplay.com/fr/cart/ajoutPanier/12?forceDuree=0")
+    
+    # 2. Vérification du Panier (Parsing HTML)
+    logger.info("🔍 Vérification du prix...")
+    r = box.session.get("https://www.boxtoplay.com/fr/cart/basket")
+    
+    if "Rupture de stock" in r.text:
+        logger.error("❌ OFFRE GRATUITE EN RUPTURE DE STOCK. Abandon.")
+        empty_cart(box)
+        return False
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    
+    # On cherche le total. Selecteur basé sur votre HTML : .panier-summary-value (le dernier est le total)
+    prices = soup.select(".panier-summary-value")
+    if not prices:
+        logger.error("❌ Impossible de lire le prix. Abandon par sécurité.")
+        empty_cart(box)
+        return False
+        
+    # Le dernier élément est le "Reste à payer" en rouge/vert
+    total_str = prices[-1].text.strip().replace('€', '').replace(' ', '')
+    
+    try:
+        total = float(total_str)
+        if total > 0.00:
+            logger.error(f"❌ DANGER : Le panier n'est pas gratuit ({total} €). Abandon immédiat.")
+            empty_cart(box)
+            return False
+    except:
+        logger.error(f"❌ Erreur lecture prix ({total_str}). Abandon.")
+        empty_cart(box)
+        return False
+        
+    # 3. Validation (Uniquement si gratuit)
+    logger.info("✅ Panier gratuit (0.00 €). Validation...")
+    
+    # La validation est un POST sur /fr/cart/livraison
+    # Pas de payload complexe d'après votre JS : $.ajax({url: "/fr/cart/livraison", type: "POST"})
+    res = box.session.post("https://www.boxtoplay.com/fr/cart/livraison")
+    
+    if "Félicitations" in res.text or res.status_code == 200:
+        logger.info("🎉 Serveur commandé avec succès !")
+        time.sleep(10) # Temps de création
+        return True
+    else:
+        logger.error("❌ Erreur lors de la validation finale.")
+        return False
+
+def empty_cart(box: BoxSession):
+    """Vide le panier pour ne pas laisser de trucs payants"""
+    logger.info("🗑️ Vidage du panier...")
+    # URL de suppression trouvée dans votre HTML: /fr/cart/retirerPanier/0
+    box.session.get("https://www.boxtoplay.com/fr/cart/retirerPanier/0")
+
+def create_ftp_account(box: BoxSession, server_id, password):
+    logger.info("📁 Création compte FTP...")
+    url_page = f"https://www.boxtoplay.com/minecraft/ftp/{server_id}"
+    
+    # On génère un user unique
+    ftp_user = f"user_{int(time.time())}"
+    
+    # Note : Je déduis ici les champs standards. 
+    # SI ÇA PLANTE : Il faudra vérifier les 'name' des inputs sur la page FTP
+    payload = {
+        "username": ftp_user,     # Probable name="username" ou "login"
+        "password": password,     # name="password" (vu dans votre xpath)
+        "action": "create"        # Souvent un champ caché pour l'action
     }
     
-    response = requests.patch(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
-    response.raise_for_status()
+    # On tente le POST sur la même URL (classique)
+    box.session.post(url_page, data=payload)
     
-    # Log des infos sauvegardées
-    logger.info("📤 État sauvegardé dans le Gist:")
-    logger.info(f"   - active_account_index: {new_state.get('active_account_index')}")
-    logger.info(f"   - current_server_id: {new_state.get('current_server_id')}")
-    if target_index is not None:
-        acc = new_state["accounts"][target_index]
-        logger.info(f"   - Compte {target_index}: server_id={acc.get('server_id')}, ftp_host={acc.get('ftp_host')}, ftp_user={acc.get('ftp_user')}")
-
-
-# =============================================================================
-# DRIVER SELENIUM - MODE HEADLESS OBLIGATOIRE
-# =============================================================================
-
-def create_headless_driver() -> webdriver.Firefox:
-    """
-    Crée un driver Firefox en mode HEADLESS (obligatoire pour Codespaces).
+    # On recharge la page pour scraper le HOST attribué
+    r = box.session.get(url_page)
+    soup = BeautifulSoup(r.text, 'html.parser')
     
-    Options configurées:
-    - --headless: Pas d'interface graphique
-    - --no-sandbox: Nécessaire pour environnement conteneurisé
-    - --disable-dev-shm-usage: Évite les problèmes de mémoire partagée
-    
-    Returns:
-        webdriver.Firefox: Instance du driver configuré
-    """
-    options = Options()
-    
-    # MODE HEADLESS OBLIGATOIRE (pas d'écran sur Codespaces)
-    options.add_argument("--headless")
-    
-    # Options pour environnement serveur Linux
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    
-    # User-Agent personnalisé
-    options.set_preference("general.useragent.override", USER_AGENT)
-    
-    driver = webdriver.Firefox(options=options)
-    driver.implicitly_wait(5)
-    
-    logger.info("🌐 Driver Firefox (headless) initialisé")
-    return driver
-
-
-def close_driver(driver: webdriver.Firefox) -> None:
-    """Ferme proprement le driver Selenium."""
+    # Selecteur basé sur votre XPath : /html/body/div/div[2]/div[2]/div/div[2]/div[1]/div/table/tbody/tr[2]/td[2]
+    # En CSS : table tr:nth-child(2) td:nth-child(2)
     try:
-        driver.quit()
-        logger.info("🔒 Driver fermé")
-    except Exception as e:
-        logger.warning(f"Erreur fermeture driver: {e}")
-
-
-# =============================================================================
-# FONCTIONS UTILITAIRES SELENIUM
-# =============================================================================
-
-def click_xpath(driver: webdriver.Firefox, xpath: str, timeout: int = 10) -> None:
-    """Clique sur un élément identifié par son XPATH."""
-    WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, xpath))
-    ).click()
-
-
-def send_keys_xpath(driver: webdriver.Firefox, xpath: str, text: str, timeout: int = 10) -> None:
-    """Saisit du texte dans un champ identifié par son XPATH."""
-    element = WebDriverWait(driver, timeout).until(
-        EC.visibility_of_element_located((By.XPATH, xpath))
-    )
-    element.clear()
-    element.send_keys(text)
-
-
-def get_text_xpath(driver: webdriver.Firefox, xpath: str, timeout: int = 10) -> str:
-    """Récupère le texte d'un élément identifié par son XPATH."""
-    element = WebDriverWait(driver, timeout).until(
-        EC.visibility_of_element_located((By.XPATH, xpath))
-    )
-    return element.text
-
-
-def safe_click(driver: webdriver.Firefox, xpath: str) -> bool:
-    """Tente de cliquer sur un élément, retourne False si échec."""
-    try:
-        click_xpath(driver, xpath, timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-def get_all_cookies(driver: webdriver.Firefox) -> dict:
-    """Récupère tous les cookies de la session sous forme de dict."""
-    cookies = driver.get_cookies()
-    return {c['name']: c['value'] for c in cookies}
-
-
-def get_session_cookie(driver: webdriver.Firefox) -> str:
-    """Récupère uniquement le cookie BOXTOPLAY_SESSION."""
-    cookies = driver.get_cookies()
-    for c in cookies:
-        if c['name'] == 'BOXTOPLAY_SESSION':
-            return c['value']
-    return ""
-
-
-# =============================================================================
-# AUTHENTIFICATION BOXTOPLAY
-# =============================================================================
-
-def login_with_cookie(driver: webdriver.Firefox, session_cookie: str) -> bool:
-    """
-    Tente de se connecter en utilisant un cookie de session existant.
-    
-    Args:
-        driver: Instance Selenium
-        session_cookie: Valeur du cookie BOXTOPLAY_SESSION
+        host = soup.select_one('table tbody tr:nth-of-type(2) td:nth-of-type(2)').text.strip()
+    except:
+        logger.warning("⚠️ Impossible de lire le Host FTP. Utilisation du défaut.")
+        host = "ftp.boxtoplay.com"
         
-    Returns:
-        bool: True si connexion réussie
-    """
-    if not session_cookie:
-        return False
-    
-    try:
-        # D'abord naviguer sur le domaine
-        driver.get("https://www.boxtoplay.com/")
-        time.sleep(1)
-        
-        # Injecter le cookie
-        driver.add_cookie({
-            "name": "BOXTOPLAY_SESSION",
-            "value": session_cookie,
-            "domain": "www.boxtoplay.com",
-            "path": "/"
-        })
-        
-        # Vérifier l'accès au panel
-        driver.get("https://www.boxtoplay.com/panel")
-        time.sleep(2)
-        
-        if "panel" in driver.current_url:
-            logger.info("🔐 Connexion via cookie réussie")
-            return True
-        
-        return False
-        
-    except Exception as e:
-        logger.warning(f"Échec connexion cookie: {e}")
-        return False
+    return {"host": host, "user": ftp_user, "password": password}
 
-
-def login_with_credentials(driver: webdriver.Firefox, email: str, password: str) -> bool:
-    """
-    Connexion avec email et mot de passe.
-    
-    Args:
-        driver: Instance Selenium
-        email: Email du compte BoxToPlay
-        password: Mot de passe du compte
-        
-    Returns:
-        bool: True si connexion réussie
-    """
-    try:
-        driver.get("https://www.boxtoplay.com/fr/login")
-        time.sleep(2)
-        
-        # Accepter les cookies si présent
-        safe_click(driver, SELECTORS["cookies_accept"])
-        
-        # Remplir le formulaire
-        send_keys_xpath(driver, SELECTORS["email_input"], email)
-        send_keys_xpath(driver, SELECTORS["password_input"], password)
-        
-        # Soumettre
-        click_xpath(driver, SELECTORS["login_button"])
-        time.sleep(3)
-        
-        # Vérifier la connexion
-        driver.get("https://www.boxtoplay.com/panel")
-        time.sleep(2)
-        
-        if "panel" in driver.current_url:
-            logger.info(f"🔑 Connexion credentials réussie pour: {email}")
-            return True
-        
-        logger.warning(f"⚠️ Échec connexion pour: {email}")
-        return False
-        
-    except Exception as e:
-        logger.error(f"Erreur connexion: {e}")
-        return False
-
-
-def logout(driver: webdriver.Firefox) -> None:
-    """Déconnexion du compte BoxToPlay."""
-    try:
-        driver.get("https://www.boxtoplay.com/fr/login/logout")
-        driver.delete_all_cookies()
-        time.sleep(1)
-        logger.info("🚪 Déconnexion effectuée")
-    except Exception as e:
-        logger.warning(f"Erreur déconnexion: {e}")
-
-
-# =============================================================================
-# GESTION DES SERVEURS BOXTOPLAY
-# =============================================================================
-
-def get_current_server_id(driver: webdriver.Firefox) -> str:
-    """
-    Récupère l'ID du serveur actuel depuis le panel.
-    
-    Returns:
-        str: ID du serveur ou None si aucun serveur
-    """
-    try:
-        driver.get("https://www.boxtoplay.com/panel")
-        time.sleep(2)
-        
-        blocks = driver.find_elements(By.CSS_SELECTOR, 'body .block')
-        nb_server = len(blocks)
-        
-        if nb_server == 0:
-            logger.warning("Aucun serveur trouvé")
-            return None
-        
-        # Récupère l'ID du serveur le plus récent
-        xpath = f'/html/body/div/div[2]/div[2]/div/div[{nb_server*2}]/div[1]/h2/a/strong'
-        server_text = get_text_xpath(driver, xpath)
-        
-        # Enlève le # devant l'ID
-        server_id = server_text.lstrip('#')
-        logger.info(f"🖥️ Serveur trouvé: #{server_id}")
-        return server_id
-        
-    except Exception as e:
-        logger.error(f"Erreur récupération serveur: {e}")
-        return None
-
-
-def buy_free_server(driver: webdriver.Firefox) -> bool:
-    """
-    Achète/active le serveur gratuit Leviathan.
-    
-    Returns:
-        bool: True si achat réussi
-    """
-    try:
-        # Page de location
-        driver.get("https://www.boxtoplay.com/fr/serveur-minecraft/location-minecraft")
-        time.sleep(2)
-        
-        # Accepter cookies si nécessaire
-        safe_click(driver, SELECTORS["cookies_accept"])
-        
-        # Ajouter le serveur Leviathan (ID 12) au panier
-        driver.get("https://www.boxtoplay.com/fr/cart/ajoutPanier/12")
-        time.sleep(2)
-        logger.info("🛒 Serveur Leviathan ajouté au panier")
-        
-        # Checkout
-        click_xpath(driver, SELECTORS["checkout"])
-        time.sleep(1)
-        
-        # Accepter CGU
-        click_xpath(driver, SELECTORS["gcu"])
-        time.sleep(1)
-        
-        logger.info("💳 Commande validée")
-        
-        # Attendre la création du serveur
-        time.sleep(10)
-        
-        driver.get("https://www.boxtoplay.com/panel")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Erreur achat serveur: {e}")
-        return False
-
-
-def change_server_dns(driver: webdriver.Firefox, server_id: str, dns_name: str) -> None:
-    """
-    Change le DNS/sous-domaine du serveur.
-    
-    Args:
-        driver: Instance Selenium
-        server_id: ID du serveur
-        dns_name: Nouveau nom DNS (ex: "orny" pour orny.boxtoplay.com)
-    """
-    script = f'''
-    fetch("https://www.boxtoplay.com/minecraft/setServerDNS", {{
-        "credentials": "include",
-        "headers": {{
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest"
-        }},
-        "body": "name=&value={dns_name}&pk={server_id}",
-        "method": "POST"
-    }});
-    '''
-    driver.execute_script(script)
-    logger.info(f"🔗 DNS changé vers: {dns_name}.boxtoplay.com")
-
-
-def start_server(driver: webdriver.Firefox, server_id: str) -> None:
-    """Démarre le serveur Minecraft."""
-    driver.execute_script(f"window.open('https://www.boxtoplay.com/minecraft/start/{server_id}')")
-    time.sleep(2)
-    driver.switch_to.window(driver.window_handles[-1])
-    driver.close()
-    driver.switch_to.window(driver.window_handles[0])
-    logger.info(f"▶️ Serveur #{server_id} démarré")
-
-
-def stop_server(driver: webdriver.Firefox, server_id: str) -> None:
-    """Arrête le serveur Minecraft."""
-    driver.execute_script(f"window.open('https://www.boxtoplay.com/minecraft/stop/{server_id}')")
-    time.sleep(2)
-    driver.switch_to.window(driver.window_handles[-1])
-    driver.close()
-    driver.switch_to.window(driver.window_handles[0])
-    logger.info(f"⏹️ Serveur #{server_id} arrêté")
-
-
-def install_modpack(driver: webdriver.Firefox, server_id: str) -> None:
-    """Installe le modpack par défaut sur le serveur."""
+def install_modpack(box: BoxSession, server_id):
+    logger.info("📦 Installation Modpack...")
+    # URL fournie dans votre script Selenium
     url = f"https://www.boxtoplay.com/minecraft/modpacks/cursemodpacks/install/{server_id}?packVersionId=10517&mapReset=true&pluginsReset=true"
-    driver.execute_script(f"window.open('{url}')")
-    time.sleep(2)
-    driver.switch_to.window(driver.window_handles[-1])
-    driver.close()
-    driver.switch_to.window(driver.window_handles[0])
-    logger.info(f"📦 Modpack installé sur #{server_id}")
+    box.session.get(url)
 
+def start_server(box: BoxSession, server_id):
+    logger.info("▶️ Démarrage serveur...")
+    box.session.get(f"https://www.boxtoplay.com/minecraft/start/{server_id}")
 
 # =============================================================================
-# GESTION FTP
+# TRANSFERT LFTP
 # =============================================================================
 
-def setup_ftp_account(driver: webdriver.Firefox, server_id: str, ftp_password: str) -> dict:
-    """
-    Configure un compte FTP sur le nouveau serveur.
-    
-    Args:
-        driver: Instance Selenium
-        server_id: ID du serveur
-        ftp_password: Mot de passe pour le compte FTP
-        
-    Returns:
-        dict: {"host": "...", "user": "...", "password": "..."}
-    """
+def run_lftp(command_args):
     try:
-        driver.get(f"https://www.boxtoplay.com/minecraft/ftp/{server_id}")
-        time.sleep(2)
-        
-        # Clic sur "Ajouter un compte"
-        click_xpath(driver, SELECTORS["add_ftp_account"])
-        time.sleep(1)
-        
-        # Récupère le host FTP
-        ftp_host = get_text_xpath(driver, SELECTORS["ftp_host"])
-        
-        # Génère un nom d'utilisateur unique
-        ftp_user = f"user_{int(time.time())}"
-        
-        # Remplit le formulaire
-        WebDriverWait(driver, 5).until(
-            EC.visibility_of_element_located(
-                (By.CSS_SELECTOR, "div.form-group:nth-child(2) > div:nth-child(2) > input:nth-child(1)")
-            )
-        ).send_keys(ftp_user)
-        
-        send_keys_xpath(driver, SELECTORS["ftp_password"], ftp_password)
-        click_xpath(driver, SELECTORS["ftp_submit"])
-        
-        time.sleep(2)
-        
-        result = {
-            "host": ftp_host,
-            "user": ftp_user,
-            "password": ftp_password
-        }
-        
-        logger.info(f"📁 Compte FTP créé: {ftp_user}@{ftp_host}")
-        return result
-        
+        subprocess.run(['lftp'] + command_args, check=True, timeout=600)
     except Exception as e:
-        logger.error(f"Erreur création FTP: {e}")
-        raise
+        logger.error(f"Erreur LFTP: {e}")
 
-
-# =============================================================================
-# TRANSFERT FTP VIA LFTP (Exécution locale sur Codespaces)
-# =============================================================================
-
-def ensure_temp_dir() -> str:
-    """Crée et retourne le chemin du dossier temporaire."""
+def transfer_world(source, target):
+    if not source or not source.get('host'): return
+    
     os.makedirs(TEMP_DIR, exist_ok=True)
-    return TEMP_DIR
-
-
-def cleanup_temp_dir() -> None:
-    """Supprime le dossier temporaire et son contenu."""
-    try:
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            logger.info("🧹 Dossier temporaire nettoyé")
-    except Exception as e:
-        logger.warning(f"Erreur nettoyage: {e}")
-
-
-def lftp_download(ftp_host: str, ftp_user: str, ftp_pass: str, 
-                  remote_path: str, local_path: str) -> bool:
-    """
-    Télécharge des fichiers depuis un serveur FTP via LFTP.
+    local_world = os.path.join(TEMP_DIR, "world")
     
-    Exécute LFTP localement sur le Codespace (pas de gcloud).
-    
-    Args:
-        ftp_host: Hôte FTP source
-        ftp_user: Utilisateur FTP
-        ftp_pass: Mot de passe FTP
-        remote_path: Chemin distant à télécharger
-        local_path: Chemin local de destination
-        
-    Returns:
-        bool: True si succès
-    """
-    os.makedirs(local_path, exist_ok=True)
-    
-    # Commande LFTP avec mirror pour téléchargement récursif
-    command = [
-        'lftp',
-        '-u', f'{ftp_user},{ftp_pass}',
-        f'ftp://{ftp_host}',
-        '-e', f'mirror --verbose --parallel=5 {remote_path} {local_path}; quit'
+    # 1. Download
+    logger.info("📥 Téléchargement (Source -> Worker)...")
+    cmd_down = [
+        '-u', f"{source['user']},{source['password']}", 
+        f"ftp://{source['host']}",
+        '-e', f"mirror --verbose --parallel=10 --delete /world {local_world}; quit"
     ]
+    run_lftp(cmd_down)
     
-    try:
-        logger.info(f"⬇️ Téléchargement: {ftp_host}:{remote_path} → {local_path}")
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
-        
-        if result.returncode == 0:
-            logger.info("✅ Téléchargement terminé")
-            return True
-        else:
-            logger.error(f"Erreur LFTP: {result.stderr}")
-            return False
-            
-    except subprocess.TimeoutExpired:
-        logger.error("❌ Timeout téléchargement FTP")
-        return False
-    except Exception as e:
-        logger.error(f"Erreur téléchargement: {e}")
-        return False
-
-
-def lftp_upload(ftp_host: str, ftp_user: str, ftp_pass: str,
-                local_path: str, remote_path: str) -> bool:
-    """
-    Upload des fichiers vers un serveur FTP via LFTP.
-    
-    Args:
-        ftp_host: Hôte FTP destination
-        ftp_user: Utilisateur FTP
-        ftp_pass: Mot de passe FTP
-        local_path: Chemin local source
-        remote_path: Chemin distant destination
-        
-    Returns:
-        bool: True si succès
-    """
-    if not os.path.exists(local_path):
-        logger.warning(f"⚠️ Chemin local inexistant: {local_path}")
-        return False
-    
-    # Commande LFTP avec mirror --reverse pour upload
-    command = [
-        'lftp',
-        '-u', f'{ftp_user},{ftp_pass}',
-        f'ftp://{ftp_host}',
-        '-e', f'mirror --reverse --verbose --parallel=5 {local_path} {remote_path}; quit'
+    # 2. Upload
+    logger.info("📤 Envoi (Worker -> Cible)...")
+    cmd_up = [
+        '-u', f"{target['user']},{target['password']}", 
+        f"ftp://{target['host']}",
+        '-e', f"mirror --reverse --verbose --parallel=10 {local_world} /world; quit"
     ]
+    run_lftp(cmd_up)
     
-    try:
-        logger.info(f"⬆️ Upload: {local_path} → {ftp_host}:{remote_path}")
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
-        
-        if result.returncode == 0:
-            logger.info("✅ Upload terminé")
-            return True
-        else:
-            logger.error(f"Erreur LFTP: {result.stderr}")
-            return False
-            
-    except subprocess.TimeoutExpired:
-        logger.error("❌ Timeout upload FTP")
-        return False
-    except Exception as e:
-        logger.error(f"Erreur upload: {e}")
-        return False
-
-
-def transfer_world_data(source_ftp: dict, target_ftp: dict) -> bool:
-    """
-    Transfère les données du monde de l'ancien serveur vers le nouveau.
-    
-    Processus:
-    1. Télécharge /world depuis le serveur source vers /tmp
-    2. Upload /world vers le serveur cible
-    3. Nettoie les fichiers temporaires
-    
-    Args:
-        source_ftp: {"host": "...", "user": "...", "password": "..."}
-        target_ftp: {"host": "...", "user": "...", "password": "..."}
-        
-    Returns:
-        bool: True si transfert réussi
-    """
-    if not source_ftp or not source_ftp.get("host"):
-        logger.info("⏭️ Pas de serveur source, skip du transfert")
-        return True
-    
-    temp_dir = ensure_temp_dir()
-    world_local = os.path.join(temp_dir, "world")
-    
-    try:
-        # 1. Téléchargement depuis source
-        logger.info("📥 Étape 1/3: Téléchargement du monde...")
-        download_ok = lftp_download(
-            source_ftp["host"],
-            source_ftp["user"],
-            source_ftp["password"],
-            "/world",
-            world_local
-        )
-        
-        if not download_ok:
-            logger.warning("⚠️ Échec téléchargement, le monde sera vierge")
-            return True  # Continue quand même
-        
-        # 2. Upload vers cible
-        logger.info("📤 Étape 2/3: Upload du monde...")
-        upload_ok = lftp_upload(
-            target_ftp["host"],
-            target_ftp["user"],
-            target_ftp["password"],
-            world_local,
-            "/world"
-        )
-        
-        if not upload_ok:
-            logger.error("❌ Échec upload du monde")
-            return False
-        
-        # 3. Nettoyage
-        logger.info("🧹 Étape 3/3: Nettoyage...")
-        cleanup_temp_dir()
-        
-        logger.info("✅ Transfert du monde terminé avec succès")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Erreur transfert monde: {e}")
-        cleanup_temp_dir()
-        return False
-
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 # =============================================================================
-# LOGIQUE PRINCIPALE DE ROTATION
-# =============================================================================
-
-def process_active_account(driver: webdriver.Firefox, account: dict) -> dict:
-    """
-    Traite le compte ACTIF (celui qui va expirer).
-    
-    Actions:
-    - Se connecter
-    - Récupérer l'ID du serveur actuel
-    - Vider le DNS du serveur
-    - Arrêter le serveur
-    - Retourner les infos FTP pour le transfert
-    
-    Args:
-        driver: Instance Selenium
-        account: Données du compte actif depuis le Gist
-        
-    Returns:
-        dict: Infos FTP du serveur actif pour le transfert
-    """
-    logger.info(f"🔄 Traitement du compte ACTIF: {account['email']}")
-    
-    # Connexion (essaye d'abord avec le cookie)
-    cookie = account.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
-    if not login_with_cookie(driver, cookie):
-        if not login_with_credentials(driver, account["email"], account["password"]):
-            logger.error("❌ Impossible de se connecter au compte actif")
-            return None
-    
-    # Récupère l'ID du serveur
-    server_id = get_current_server_id(driver)
-    
-    if server_id:
-        # Vide le DNS (plus personne ne peut se connecter)
-        change_server_dns(driver, server_id, "")
-        time.sleep(1)
-        
-        # Arrête le serveur
-        stop_server(driver, server_id)
-    
-    # Récupère les infos FTP
-    ftp_info = {
-        "host": account.get("ftp_host"),
-        "user": account.get("ftp_user"),
-        "password": FTP_PASSWORD or account.get("ftp_password", "")
-    }
-    
-    logout(driver)
-    return ftp_info
-
-
-def process_target_account(driver: webdriver.Firefox, account: dict, ftp_password: str) -> dict:
-    """
-    Traite le compte CIBLE (celui qu'on active).
-    
-    Actions:
-    - Se connecter
-    - Acheter/activer le serveur gratuit
-    - Configurer le DNS
-    - Créer le compte FTP
-    - Récupérer les cookies frais
-    - Installer le modpack
-    
-    Args:
-        driver: Instance Selenium
-        account: Données du compte cible depuis le Gist
-        ftp_password: Mot de passe FTP à utiliser
-        
-    Returns:
-        dict: Nouvelles infos à sauvegarder dans le Gist
-    """
-    logger.info(f"🎯 Traitement du compte CIBLE: {account['email']}")
-    
-    # Connexion
-    cookie = account.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
-    if not login_with_cookie(driver, cookie):
-        if not login_with_credentials(driver, account["email"], account["password"]):
-            raise Exception("Impossible de se connecter au compte cible")
-    
-    # Achat du serveur
-    if not buy_free_server(driver):
-        raise Exception("Échec de l'achat du serveur")
-    
-    # Récupère l'ID du nouveau serveur
-    server_id = None
-    for attempt in range(10):
-        server_id = get_current_server_id(driver)
-        if server_id:
-            break
-        logger.info(f"⏳ Attente du serveur... ({attempt+1}/10)")
-        time.sleep(3)
-    
-    if not server_id:
-        raise Exception("Serveur non trouvé après l'achat")
-    
-    # Configure le DNS
-    change_server_dns(driver, server_id, IP_NEW_SERVER)
-    time.sleep(1)
-    
-    # Configure le FTP
-    ftp_info = setup_ftp_account(driver, server_id, ftp_password)
-    
-    # Installe le modpack
-    install_modpack(driver, server_id)
-    
-    # Récupère les cookies frais (pour le bot Discord)
-    fresh_cookies = get_all_cookies(driver)
-    
-    # =========================================
-    # VALIDATION DES DONNÉES AVANT RETOUR
-    # =========================================
-    logger.info("🔍 Validation des informations récupérées...")
-    
-    # Vérifier server_id
-    if not server_id or not str(server_id).isdigit():
-        raise ValueError(f"server_id invalide: '{server_id}'")
-    
-    # Vérifier ftp_host
-    if not ftp_info.get("host") or len(ftp_info["host"]) < 5:
-        raise ValueError(f"ftp_host invalide: '{ftp_info.get('host')}'")
-    
-    # Vérifier ftp_user
-    if not ftp_info.get("user") or len(ftp_info["user"]) < 3:
-        raise ValueError(f"ftp_user invalide: '{ftp_info.get('user')}'")
-    
-    # Vérifier cookies
-    if not fresh_cookies.get("BOXTOPLAY_SESSION"):
-        logger.warning("⚠️ Cookie BOXTOPLAY_SESSION non trouvé, tentative de récupération...")
-        # Réessayer la récupération des cookies
-        driver.get("https://www.boxtoplay.com/panel")
-        time.sleep(2)
-        fresh_cookies = get_all_cookies(driver)
-        
-        if not fresh_cookies.get("BOXTOPLAY_SESSION"):
-            raise ValueError("Cookie BOXTOPLAY_SESSION introuvable après retry")
-    
-    # Validation globale
-    if not validate_server_info(server_id, ftp_info["host"], ftp_info["user"]):
-        raise ValueError("Validation des informations serveur échouée")
-    
-    result = {
-        "server_id": str(server_id),  # Toujours en string
-        "ftp_host": ftp_info["host"],
-        "ftp_user": ftp_info["user"],
-        "ftp_password": ftp_password,
-        "cookies": fresh_cookies
-    }
-    
-    logger.info(f"✅ Infos serveur validées: #{server_id} @ {ftp_info['host']}")
-    return result
-
-
-def finalize_server(driver: webdriver.Firefox, account: dict, server_id: str) -> None:
-    """
-    Finalise le serveur (démarrage après transfert).
-    
-    Args:
-        driver: Instance Selenium
-        account: Données du compte avec cookies
-        server_id: ID du serveur à démarrer
-    """
-    logger.info("🏁 Finalisation du serveur...")
-    
-    cookie = account.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
-    if login_with_cookie(driver, cookie):
-        start_server(driver, server_id)
-        logout(driver)
-
-
-# =============================================================================
-# MAIN - POINT D'ENTRÉE
+# MAIN
 # =============================================================================
 
 def main():
-    """
-    Point d'entrée principal du worker.
+    logger.info("🚀 WORKER HTTP START")
+    state = get_state()
     
-    Workflow:
-    1. Récupère l'état depuis le Gist
-    2. Identifie le compte actif (qui expire) et le compte cible (à activer)
-    3. Traite le compte actif (arrêt, récupération FTP)
-    4. Traite le compte cible (achat, config FTP, cookies)
-    5. Transfère le monde de l'ancien vers le nouveau serveur
-    6. Démarre le nouveau serveur
-    7. Sauvegarde le nouvel état dans le Gist (bascule d'index)
-    """
-    logger.info("=" * 70)
-    logger.info("🚀 BOXTOPLAY WORKER - Démarrage")
-    logger.info(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 70)
+    current_idx = state.get("active_account_index", 0)
+    next_idx = 1 if current_idx == 0 else 0
     
-    # Vérification des variables d'environnement
-    if not GIST_ID or not GH_TOKEN:
-        logger.error("❌ Variables d'environnement manquantes!")
-        logger.error("   Définissez: GIST_ID, GH_TOKEN")
-        return 1
+    acc_active = state["accounts"][current_idx]
+    acc_target = state["accounts"][next_idx]
+    common_pass = state.get("ftp_password", "Password123")
     
-    driver = None
+    # --- 1. GESTION COMPTE ACTIF (Désactivation) ---
+    logger.info(f"🔄 Désactivation du compte : {acc_active['email']}")
+    box_active = BoxSession(acc_active.get("cookies"))
     
-    try:
-        # =================================================================
-        # ÉTAPE 1: Récupération de l'état depuis le Gist
-        # =================================================================
-        logger.info("\n📋 ÉTAPE 1: Récupération de l'état")
-        state = get_state()
-        
-        current_index = state.get("active_account_index", 0)
-        next_index = 1 if current_index == 0 else 0
-        
-        active_account = state["accounts"][current_index]  # Celui qui expire
-        target_account = state["accounts"][next_index]     # Celui qu'on active
-        
-        ftp_password = FTP_PASSWORD or state.get("ftp_password", "defaultpass")
-        
-        logger.info(f"🔄 Rotation: {active_account['email']} → {target_account['email']}")
-        
-        # =================================================================
-        # ÉTAPE 2: Traitement du compte actif (arrêt de l'ancien serveur)
-        # =================================================================
-        logger.info("\n⏹️ ÉTAPE 2: Arrêt de l'ancien serveur")
-        driver = create_headless_driver()
-        
-        source_ftp = None
-        if active_account.get("ftp_host"):
-            source_ftp = process_active_account(driver, active_account)
-        else:
-            logger.info("⏭️ Pas de serveur actif précédent")
-        
-        close_driver(driver)
-        driver = None
-        
-        # =================================================================
-        # ÉTAPE 3: Traitement du compte cible (achat nouveau serveur)
-        # =================================================================
-        logger.info("\n🎯 ÉTAPE 3: Activation du nouveau serveur")
-        driver = create_headless_driver()
-        
-        target_result = process_target_account(driver, target_account, ftp_password)
-        
-        close_driver(driver)
-        driver = None
-        
-        # =================================================================
-        # ÉTAPE 4: Transfert FTP (ancien → nouveau)
-        # =================================================================
-        logger.info("\n📦 ÉTAPE 4: Transfert du monde")
-        
-        target_ftp = {
-            "host": target_result["ftp_host"],
-            "user": target_result["ftp_user"],
-            "password": ftp_password
-        }
-        
-        transfer_world_data(source_ftp, target_ftp)
-        
-        # =================================================================
-        # ÉTAPE 5: Démarrage du nouveau serveur
-        # =================================================================
-        logger.info("\n▶️ ÉTAPE 5: Démarrage du serveur")
-        driver = create_headless_driver()
-        
-        # Met à jour le compte avec les nouvelles infos pour la connexion
-        target_account_updated = {**target_account, **target_result}
-        finalize_server(driver, target_account_updated, target_result["server_id"])
-        
-        close_driver(driver)
-        driver = None
-        
-        # =================================================================
-        # ÉTAPE 6: Sauvegarde de l'état dans le Gist
-        # =================================================================
-        logger.info("\n💾 ÉTAPE 6: Sauvegarde de l'état")
-        
-        # Vérification que les données à sauvegarder sont valides
-        logger.info("🔍 Vérification des données avant sauvegarde...")
-        
-        if not target_result.get("server_id"):
-            raise ValueError("❌ Impossible de sauvegarder: server_id manquant!")
-        if not target_result.get("ftp_host"):
-            raise ValueError("❌ Impossible de sauvegarder: ftp_host manquant!")
-        if not target_result.get("ftp_user"):
-            raise ValueError("❌ Impossible de sauvegarder: ftp_user manquant!")
-        if not target_result.get("cookies", {}).get("BOXTOPLAY_SESSION"):
-            raise ValueError("❌ Impossible de sauvegarder: cookies manquants!")
-        
-        # Mise à jour de l'état global
-        state["active_account_index"] = next_index
-        state["current_server_id"] = str(target_result["server_id"])  # Toujours string
-        
-        # Mise à jour du compte cible avec les nouvelles infos
-        state["accounts"][next_index]["cookies"] = target_result["cookies"]
-        state["accounts"][next_index]["ftp_host"] = target_result["ftp_host"]
-        state["accounts"][next_index]["ftp_user"] = target_result["ftp_user"]
-        state["accounts"][next_index]["server_id"] = str(target_result["server_id"])
-        
-        # Log des changements
-        logger.info(f"📝 Nouvelles valeurs à sauvegarder:")
-        logger.info(f"   - active_account_index: {current_index} → {next_index}")
-        logger.info(f"   - current_server_id: {state.get('current_server_id')}")
-        logger.info(f"   - accounts[{next_index}].server_id: {target_result['server_id']}")
-        logger.info(f"   - accounts[{next_index}].ftp_host: {target_result['ftp_host']}")
-        logger.info(f"   - accounts[{next_index}].ftp_user: {target_result['ftp_user']}")
-        
-        # Sauvegarde avec validation
-        update_state(state, target_index=next_index)
-        
-        # =================================================================
-        # TERMINÉ
-        # =================================================================
-        logger.info("\n" + "=" * 70)
-        logger.info("✅ MIGRATION TERMINÉE AVEC SUCCÈS!")
-        logger.info(f"🖥️ Nouveau serveur actif: #{target_result['server_id']}")
-        logger.info(f"🌐 DNS: {IP_NEW_SERVER}.boxtoplay.com")
-        logger.info(f"👤 Compte actif: {target_account['email']}")
-        logger.info("=" * 70)
-        
-        return 0
-        
-    except Exception as e:
-        logger.error(f"\n❌ ERREUR FATALE: {e}")
-        logger.error(traceback.format_exc())
-        return 1
-        
-    finally:
-        # Nettoyage
-        if driver:
-            close_driver(driver)
-        cleanup_temp_dir()
+    if box_active.is_logged_in():
+        srv_id = get_current_server_id(box_active)
+        if srv_id:
+            change_dns(box_active, srv_id, "") # Libération DNS
+            stop_server(box_active, srv_id)
+    else:
+        logger.warning("⚠️ Session active expirée. Impossible d'arrêter proprement.")
 
-
-# =============================================================================
-# EXÉCUTION
-# =============================================================================
+    # Infos FTP pour le transfert (depuis le Gist)
+    ftp_source = {
+        "host": acc_active.get("ftp_host"),
+        "user": acc_active.get("ftp_user"),
+        "password": common_pass
+    }
+    
+    # --- 2. GESTION COMPTE CIBLE (Activation) ---
+    logger.info(f"🎯 Activation du compte : {acc_target['email']}")
+    box_target = BoxSession(acc_target.get("cookies"))
+    
+    if not box_target.is_logged_in():
+        raise Exception("❌ CRITIQUE : La session du compte cible est expirée. Le Bot Discord n'a pas fait son travail.")
+    
+    # Achat sécurisé
+    if not buy_server_safe(box_target):
+        logger.warning("⚠️ Achat non réalisé (Serveur déjà là ou rupture de stock).")
+    
+    # Récupération ID
+    srv_id_target = None
+    for _ in range(5):
+        srv_id_target = get_current_server_id(box_target)
+        if srv_id_target: break
+        time.sleep(2)
+        
+    if not srv_id_target:
+        raise Exception("❌ Impossible de trouver le nouveau serveur.")
+    
+    # Config
+    change_dns(box_target, srv_id_target, IP_NEW_SERVER)
+    ftp_target = create_ftp_account(box_target, srv_id_target, common_pass)
+    install_modpack(box_target, srv_id_target)
+    
+    # --- 3. TRANSFERT & START ---
+    transfer_world(ftp_source, ftp_target)
+    start_server(box_target, srv_id_target)
+    
+    # --- 4. SAUVEGARDE ---
+    state["active_account_index"] = next_idx
+    state["current_server_id"] = srv_id_target
+    state["accounts"][next_idx]["ftp_host"] = ftp_target["host"]
+    state["accounts"][next_idx]["ftp_user"] = ftp_target["user"]
+    
+    update_state(state)
+    logger.info("✅ MIGRATION TERMINÉE")
 
 if __name__ == "__main__":
-    # Kill les processus Firefox orphelins (nettoyage)
-    try:
-        subprocess.run(["pkill", "-f", "firefox"], capture_output=True)
-    except Exception:
-        pass
-    
-    exit_code = main()
-    exit(exit_code)
+    main()

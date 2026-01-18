@@ -1,5 +1,6 @@
 # BoxToPlay Worker - Dépendances Python
 # Compatible GitHub Codespaces
 
-selenium>=4.0.0
-requests>=2.28.0
+requests
+beautifulsoup4
+lftp

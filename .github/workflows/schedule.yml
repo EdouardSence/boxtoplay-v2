@@ -2,46 +2,26 @@ name: Rotation Serveur Minecraft
 
 on:
   schedule:
-    # Lance le script à 00:00, 08:00 et 16:00 UTC
-    - cron: "0 0,8,16 * * *"
-  workflow_dispatch: # Permet de lancer manuellement pour tester
+    - cron: "0 7,15,23 * * *"
+  workflow_dispatch:
 
 jobs:
   migrate:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Récupération du code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Installation de Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      # 1. On installe LFTP normalement
-      - name: Installation de LFTP
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y lftp
+          sudo apt-get update && sudo apt-get install -y lftp
+          pip install requests beautifulsoup4
 
-      # 2. On installe Firefox via l'action officielle
-      - name: Setup Firefox
-        uses: browser-actions/setup-firefox@v1
-        with:
-          firefox-version: "latest"
-
-      # 3. On installe Geckodriver (CORRECTION ICI : use @latest)
-      - name: Setup Geckodriver
-        uses: browser-actions/setup-geckodriver@latest
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Installation des librairies Python
-        run: |
-          pip install -r requirements.txt
-
-      - name: Exécution du Worker
+      - name: Run Worker HTTP
         env:
           GIST_ID: ${{ secrets.GIST_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
