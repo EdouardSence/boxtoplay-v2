@@ -513,18 +513,25 @@ class BoxToPlayWorker:
         await self.page.wait_for_timeout(5000)
 
     async def start_server(self, server_id):
-        """Demarre le serveur."""
-        logger.info(f"Demarrage serveur {server_id}...")
-        response = await self.page.goto(
-            URLS["start"].format(server_id=server_id),
-            wait_until="networkidle",
-            timeout=30000,
-        )
-        status = response.status if response else 0
-        if status == 200:
-            logger.info(f"Serveur {server_id} demarre.")
-        else:
-            logger.warning(f"Demarrage serveur: HTTP {status}")
+        """Demarre le serveur avec retries en cas de 401/403."""
+        for attempt in range(3):
+            logger.info(f"Demarrage serveur {server_id} (tentative {attempt + 1}/3)...")
+            response = await self.page.goto(
+                URLS["start"].format(server_id=server_id),
+                wait_until="networkidle",
+                timeout=30000,
+            )
+            status = response.status if response else 0
+            if status == 200:
+                logger.info(f"Serveur {server_id} demarre.")
+                return
+            elif status in (401, 403) and attempt < 2:
+                logger.warning(f"Demarrage serveur: HTTP {status}, retry dans 5s...")
+                # Re-naviguer vers le panel pour rafraichir la session
+                await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
+                await self.page.wait_for_timeout(5000)
+            else:
+                logger.warning(f"Demarrage serveur: HTTP {status}")
 
     async def get_cookies_string(self):
         """Recupere les cookies du navigateur au format chaine pour le Gist."""
