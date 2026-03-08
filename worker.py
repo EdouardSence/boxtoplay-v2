@@ -170,161 +170,77 @@ class BoxToPlayWorker:
 
     # ----- Actions BoxToPlay -----
 
-    async def login(self, email, password):
-        """Se connecte a BoxToPlay avec email/mot de passe."""
-        logger.info(f"Connexion: {email}...")
+    async def login(self, email, cookie_string):
+        """Se connecte a BoxToPlay en injectant les cookies depuis le Gist.
+        
+        Le bot Discord (boxtoplay-bot) maintient les cookies frais via Puppeteer.
+        Le worker les injecte dans Playwright pour eviter le reCAPTCHA du login.
+        
+        Args:
+            email: L'email du compte (pour logging)
+            cookie_string: La chaine de cookies "name=value; name=value; ..."
+                           stockee dans le Gist sous accounts[i].cookies.BOXTOPLAY_SESSION
+        """
+        logger.info(f"Injection cookies pour: {email}...")
 
-        await self.page.goto(URLS["login"], wait_until="networkidle", timeout=60000)
+        if not cookie_string or not cookie_string.strip():
+            raise Exception(f"Pas de cookies dans le Gist pour {email}. Le bot Discord doit les rafraichir d'abord.")
+
+        # Parser la chaine de cookies en objets Playwright
+        cookie_objects = []
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            eq_idx = part.index("=")
+            name = part[:eq_idx].strip()
+            value = part[eq_idx + 1:].strip()
+            cookie_objects.append({
+                "name": name,
+                "value": value,
+                "domain": "www.boxtoplay.com",
+                "path": "/",
+                "httpOnly": name == "BOXTOPLAY_SESSION",
+                "secure": True,
+            })
+
+        if not cookie_objects:
+            raise Exception(f"Cookie string vide ou invalide pour {email}: '{cookie_string[:50]}...'")
+
+        logger.info(f"Injection de {len(cookie_objects)} cookies: {[c['name'] for c in cookie_objects]}")
+
+        # Injecter les cookies dans le contexte Playwright
+        await self.context.add_cookies(cookie_objects)
+
+        # Verifier que la session est valide en naviguant vers le panel
+        await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=30000)
         await self._solve_cloudflare()
 
-        # Screenshot apres chargement pour debug
-        await self._screenshot(f"login_loaded_{email.split('@')[0]}")
-
-        # Fermer les overlays potentiels (cookie consent, popups)
-        for selector in [
-            'button:has-text("Accepter")',
-            'button:has-text("Accept")',
-            'button:has-text("OK")',
-            '.cookie-consent-accept',
-            '[data-dismiss="modal"]',
-        ]:
-            try:
-                btn = self.page.locator(selector).first
-                if await btn.is_visible(timeout=1000):
-                    await btn.click()
-                    logger.info(f"Overlay ferme: {selector}")
-                    await self.page.wait_for_timeout(1000)
-            except Exception:
-                pass
-
-        # Remplir le formulaire via jQuery (le site utilise jQuery + jQuery Validation)
-        # Les inputs du formulaire de login sont #emailLogin et #passwordLogin
-        # (et NON #email / #password qui sont sur le formulaire d'inscription)
-        filled = await self.page.evaluate(
-            """({email, password}) => {
-            const emailInput = document.querySelector('#emailLogin');
-            const passInput = document.querySelector('#passwordLogin');
-            if (!emailInput || !passInput) return {ok: false, reason: 'inputs_not_found'};
-
-            // Utiliser jQuery .val() pour que jQuery Validation reconnaisse les valeurs
-            if (typeof jQuery !== 'undefined') {
-                jQuery('#emailLogin').val(email).trigger('input').trigger('change').trigger('blur');
-                jQuery('#passwordLogin').val(password).trigger('input').trigger('change').trigger('blur');
-            } else {
-                // Fallback sans jQuery
-                emailInput.value = email;
-                passInput.value = password;
-                emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-                emailInput.dispatchEvent(new Event('change', { bubbles: true }));
-                passInput.dispatchEvent(new Event('input', { bubbles: true }));
-                passInput.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-
-            return {
-                ok: true,
-                emailValue: emailInput.value,
-                passLength: passInput.value.length,
-                hasJquery: typeof jQuery !== 'undefined'
-            };
-        }""",
-            {"email": email, "password": password},
-        )
-
-        if not filled or not filled.get("ok"):
-            await self._screenshot(f"login_no_inputs_{email.split('@')[0]}")
-            raise Exception(f"Inputs de login introuvables pour {email}: {filled}")
-
-        logger.info(f"Formulaire rempli (jQuery={filled.get('hasJquery')}, email={filled.get('emailValue')}, passLen={filled.get('passLength')})")
-
-        # Le site utilise jQuery Validation avec reCAPTCHA invisible:
-        #   submitHandler -> grecaptcha.execute(0) -> callback onLoginClick -> form.submit()
-        # 
-        # Strategie: d'abord essayer le flow normal (click submit -> jQuery Validation OK
-        # -> grecaptcha.execute -> callback -> form submit). Si reCAPTCHA echoue,
-        # fallback sur HTMLFormElement.prototype.submit (bypass reCAPTCHA).
-
-        # Methode 1: Click le vrai bouton submit pour declencher jQuery Validation + reCAPTCHA
-        logger.info("Soumission du formulaire (click submit)...")
-        try:
-            submit_btn = self.page.locator('#form-login button[type="submit"]').first
-            await submit_btn.click(force=True)
-        except Exception as e:
-            logger.warning(f"Click submit echoue: {e}")
-
-        # Attendre que le reCAPTCHA + la navigation se fassent (peut prendre du temps)
-        try:
-            await self.page.wait_for_url("**/panel**", timeout=20000)
-            logger.info(f"Connecte (via reCAPTCHA): {email}")
-            return
-        except PlaywrightTimeout:
-            current_url = self.page.url
-            logger.info(f"URL apres click submit: {current_url}")
-
-        # Verifier si on est reste sur login (reCAPTCHA a peut-etre bloque)
-        if "/panel" not in self.page.url:
-            await self._screenshot(f"login_after_recaptcha_{email.split('@')[0]}")
-            logger.info("reCAPTCHA n'a pas abouti. Tentative submit natif (bypass reCAPTCHA)...")
-            
-            # Re-remplir les champs (le form peut avoir ete reset)
-            await self.page.evaluate(
-                """({email, password}) => {
-                jQuery('#emailLogin').val(email).trigger('input').trigger('change');
-                jQuery('#passwordLogin').val(password).trigger('input').trigger('change');
-            }""",
-                {"email": email, "password": password},
-            )
-            
-            # Methode 2: Submit natif pour bypass jQuery Validation + reCAPTCHA
-            submitted = await self.page.evaluate("""() => {
-                const form = document.getElementById('form-login');
-                if (!form) return false;
-                HTMLFormElement.prototype.submit.call(form);
-                return true;
-            }""")
-
-            if not submitted:
-                await self._screenshot(f"login_no_submit_{email.split('@')[0]}")
-                raise Exception(f"Impossible de soumettre le formulaire pour {email}")
-
-        # Attendre la navigation post-submit (le form POST vers /fr/login/authenticate)
-        try:
-            await self.page.wait_for_load_state("networkidle", timeout=15000)
-        except PlaywrightTimeout:
-            logger.warning("Timeout en attendant networkidle apres submit")
-
-        # Verifier ou on a atterri
         current_url = self.page.url
-        logger.info(f"URL apres soumission: {current_url}")
+        logger.info(f"URL apres injection cookies: {current_url}")
 
         if "/panel" in current_url:
-            logger.info(f"Connecte: {email}")
+            logger.info(f"Connecte via cookies: {email}")
+            await self._screenshot(f"login_ok_{email.split('@')[0]}")
             return
 
-        # Si on n'est pas sur le panel, on est probablement redirige vers login
-        # ou bloque par reCAPTCHA. Prendre screenshot + dump HTML pour debug.
+        # Si on est redirige vers login, les cookies sont expires
         await self._screenshot(f"login_failed_{email.split('@')[0]}")
-
-        # Dump le HTML pour debug (titres, messages d'erreur)
+        
+        # Debug info
         debug_info = await self.page.evaluate("""() => {
-            const title = document.title;
-            const alerts = Array.from(document.querySelectorAll('.alert, .error, .help-block'))
-                .map(el => el.textContent.trim()).filter(Boolean);
-            const bodySnippet = document.body.innerText.substring(0, 500);
-            return {title, url: location.href, alerts, bodySnippet};
+            return {
+                title: document.title,
+                url: location.href,
+                bodySnippet: document.body.innerText.substring(0, 300)
+            };
         }""")
-        logger.info(f"Debug post-login: {json.dumps(debug_info, ensure_ascii=False)}")
+        logger.info(f"Debug post-injection: {json.dumps(debug_info, ensure_ascii=False)}")
 
-        if "login" in current_url or "authenticate" in current_url:
-            raise Exception(f"Echec connexion pour {email} - reCAPTCHA bloque ou identifiants invalides. URL: {current_url}")
-
-        # Si on est sur une autre page, c'est peut-etre un redirect intermediaire
-        logger.warning(f"Redirect inattendu apres login: {current_url}")
-        # Essayer de naviguer vers le panel
-        await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
-        if "/panel" not in self.page.url:
-            raise Exception(f"Impossible d'acceder au panel apres login. URL: {self.page.url}")
-
-        logger.info(f"Connecte: {email}")
+        raise Exception(
+            f"Cookies expires pour {email}. Le bot Discord doit les rafraichir. "
+            f"URL: {current_url}"
+        )
 
     async def get_server_id(self):
         """Recupere l'ID du serveur depuis le panel."""
@@ -704,7 +620,9 @@ async def main():
         logger.info("--- Phase 1: Arret de l'ancien serveur ---")
 
         try:
-            await worker.login(acc_active["email"], acc_active["password"])
+            # Utiliser les cookies du Gist (rafraichis par le bot Discord)
+            active_cookies = acc_active.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
+            await worker.login(acc_active["email"], active_cookies)
 
             server_id = await worker.get_server_id()
             if server_id:
@@ -723,7 +641,9 @@ async def main():
 
         # Nouvelle session navigateur pour le second compte
         await worker._new_session()
-        await worker.login(acc_target["email"], acc_target["password"])
+        # Utiliser les cookies du Gist (rafraichis par le bot Discord)
+        target_cookies = acc_target.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
+        await worker.login(acc_target["email"], target_cookies)
 
         # Acheter le serveur gratuit
         if not await worker.buy_server():
