@@ -197,37 +197,54 @@ class BoxToPlayWorker:
             except Exception:
                 pass
 
-        # Remplir le formulaire de login
-        # BoxToPlay utilise _username/_password ou email/password selon la version
-        email_input = self.page.locator(
-            'input[name="_username"], input[name="email"], input[type="email"]'
-        ).first
-        password_input = self.page.locator(
-            'input[name="_password"], input[name="password"], input[type="password"]'
-        ).first
+        # Remplir le formulaire via JavaScript pour bypass les inputs custom CSS
+        # (les inputs BoxToPlay sont stylises et Playwright les voit comme "not visible")
+        filled = await self.page.evaluate(
+            """({email, password}) => {
+            const emailInput = document.querySelector('input[name="email"], input[name="_username"], input#email');
+            const passInput = document.querySelector('input[name="password"], input[name="_password"], input#password');
+            if (!emailInput || !passInput) return false;
 
-        # Attendre que l'input soit visible (max 10s)
-        try:
-            await email_input.wait_for(state="visible", timeout=10000)
-        except PlaywrightTimeout:
-            await self._screenshot(f"login_input_not_visible_{email.split('@')[0]}")
-            # Essayer de scroller vers l'element
+            // Simuler une saisie native
+            function setNativeValue(el, value) {
+                const proto = Object.getPrototypeOf(el);
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+                            || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            setNativeValue(emailInput, email);
+            setNativeValue(passInput, password);
+            return true;
+        }""",
+            {"email": email, "password": password},
+        )
+
+        if not filled:
+            await self._screenshot(f"login_no_inputs_{email.split('@')[0]}")
+            raise Exception(f"Inputs de login introuvables pour {email}")
+
+        logger.info("Formulaire rempli via JS, soumission...")
+
+        # Soumettre le formulaire via click ou JS
+        submitted = await self.page.evaluate("""() => {
+            const btn = document.querySelector('button[type="submit"], input[type="submit"], .btn-connexion, a:has(span)');
+            if (btn) { btn.click(); return true; }
+            const form = document.querySelector('form');
+            if (form) { form.submit(); return true; }
+            return false;
+        }""")
+
+        if not submitted:
+            # Fallback: essayer via Playwright avec force click
             try:
-                await email_input.scroll_into_view_if_needed()
-                await self.page.wait_for_timeout(1000)
+                submit_btn = self.page.locator('button:has-text("Connexion")').first
+                await submit_btn.click(force=True)
             except Exception:
-                pass
-            # Tenter quand meme si ca echoue
-            logger.warning("Input email non visible apres 10s, tentative quand meme...")
-
-        await email_input.fill(email)
-        await password_input.fill(password)
-
-        # Soumettre
-        submit_btn = self.page.locator(
-            'button[type="submit"], input[type="submit"]'
-        ).first
-        await submit_btn.click()
+                await self._screenshot(f"login_no_submit_{email.split('@')[0]}")
+                raise Exception(f"Bouton submit introuvable pour {email}")
 
         # Attendre la redirection vers le panel
         try:
