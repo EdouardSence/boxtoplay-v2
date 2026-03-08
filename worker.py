@@ -680,21 +680,27 @@ async def main():
         target_cookies = acc_target.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
         await worker.login(acc_target["email"], target_cookies)
 
-        # Acheter le serveur gratuit
-        if not await worker.buy_server():
-            raise Exception("Achat du serveur echoue (rupture de stock ou panier payant).")
+        # Verifier si le compte cible a deja un serveur
+        existing_server_id = await worker.get_server_id()
+        if existing_server_id:
+            logger.info(f"Le compte cible a deja un serveur: #{existing_server_id}. Reutilisation.")
+            new_server_id = existing_server_id
+        else:
+            # Acheter le serveur gratuit
+            if not await worker.buy_server():
+                raise Exception("Achat du serveur echoue (rupture de stock ou panier payant).")
 
-        # Recuperer l'ID du nouveau serveur (avec retries)
-        new_server_id = None
-        for attempt in range(6):
-            new_server_id = await worker.get_server_id()
-            if new_server_id:
-                break
-            logger.info(f"Serveur pas encore disponible, retry {attempt + 1}/6...")
-            await worker.page.wait_for_timeout(5000)
+            # Recuperer l'ID du nouveau serveur (avec retries)
+            new_server_id = None
+            for attempt in range(6):
+                new_server_id = await worker.get_server_id()
+                if new_server_id:
+                    break
+                logger.info(f"Serveur pas encore disponible, retry {attempt + 1}/6...")
+                await worker.page.wait_for_timeout(5000)
 
-        if not new_server_id:
-            raise Exception("Serveur introuvable apres achat.")
+            if not new_server_id:
+                raise Exception("Serveur introuvable apres achat.")
 
         logger.info(f"Nouveau serveur: #{new_server_id}")
 
