@@ -197,65 +197,132 @@ class BoxToPlayWorker:
             except Exception:
                 pass
 
-        # Remplir le formulaire via JavaScript pour bypass les inputs custom CSS
-        # (les inputs BoxToPlay sont stylises et Playwright les voit comme "not visible")
+        # Remplir le formulaire via jQuery (le site utilise jQuery + jQuery Validation)
+        # Les inputs du formulaire de login sont #emailLogin et #passwordLogin
+        # (et NON #email / #password qui sont sur le formulaire d'inscription)
         filled = await self.page.evaluate(
             """({email, password}) => {
-            const emailInput = document.querySelector('input[name="email"], input[name="_username"], input#email');
-            const passInput = document.querySelector('input[name="password"], input[name="_password"], input#password');
-            if (!emailInput || !passInput) return false;
+            const emailInput = document.querySelector('#emailLogin');
+            const passInput = document.querySelector('#passwordLogin');
+            if (!emailInput || !passInput) return {ok: false, reason: 'inputs_not_found'};
 
-            // Simuler une saisie native
-            function setNativeValue(el, value) {
-                const proto = Object.getPrototypeOf(el);
-                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
-                            || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                setter.call(el, value);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
+            // Utiliser jQuery .val() pour que jQuery Validation reconnaisse les valeurs
+            if (typeof jQuery !== 'undefined') {
+                jQuery('#emailLogin').val(email).trigger('input').trigger('change').trigger('blur');
+                jQuery('#passwordLogin').val(password).trigger('input').trigger('change').trigger('blur');
+            } else {
+                // Fallback sans jQuery
+                emailInput.value = email;
+                passInput.value = password;
+                emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+                emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+                passInput.dispatchEvent(new Event('input', { bubbles: true }));
+                passInput.dispatchEvent(new Event('change', { bubbles: true }));
             }
 
-            setNativeValue(emailInput, email);
-            setNativeValue(passInput, password);
-            return true;
+            return {
+                ok: true,
+                emailValue: emailInput.value,
+                passLength: passInput.value.length,
+                hasJquery: typeof jQuery !== 'undefined'
+            };
         }""",
             {"email": email, "password": password},
         )
 
-        if not filled:
+        if not filled or not filled.get("ok"):
             await self._screenshot(f"login_no_inputs_{email.split('@')[0]}")
-            raise Exception(f"Inputs de login introuvables pour {email}")
+            raise Exception(f"Inputs de login introuvables pour {email}: {filled}")
 
-        logger.info("Formulaire rempli via JS, soumission...")
+        logger.info(f"Formulaire rempli (jQuery={filled.get('hasJquery')}, email={filled.get('emailValue')}, passLen={filled.get('passLength')})")
 
-        # Soumettre le formulaire via click ou JS
-        submitted = await self.page.evaluate("""() => {
-            const btn = document.querySelector('button[type="submit"], input[type="submit"], .btn-connexion, a:has(span)');
-            if (btn) { btn.click(); return true; }
-            const form = document.querySelector('form');
-            if (form) { form.submit(); return true; }
-            return false;
-        }""")
+        # Le site utilise jQuery Validation avec reCAPTCHA invisible:
+        #   submitHandler -> grecaptcha.execute(0) -> callback onLoginClick -> form.submit()
+        # 
+        # Strategie: d'abord essayer le flow normal (click submit -> jQuery Validation OK
+        # -> grecaptcha.execute -> callback -> form submit). Si reCAPTCHA echoue,
+        # fallback sur HTMLFormElement.prototype.submit (bypass reCAPTCHA).
 
-        if not submitted:
-            # Fallback: essayer via Playwright avec force click
-            try:
-                submit_btn = self.page.locator('button:has-text("Connexion")').first
-                await submit_btn.click(force=True)
-            except Exception:
-                await self._screenshot(f"login_no_submit_{email.split('@')[0]}")
-                raise Exception(f"Bouton submit introuvable pour {email}")
-
-        # Attendre la redirection vers le panel
+        # Methode 1: Click le vrai bouton submit pour declencher jQuery Validation + reCAPTCHA
+        logger.info("Soumission du formulaire (click submit)...")
         try:
-            await self.page.wait_for_url("**/panel**", timeout=15000)
+            submit_btn = self.page.locator('#form-login button[type="submit"]').first
+            await submit_btn.click(force=True)
+        except Exception as e:
+            logger.warning(f"Click submit echoue: {e}")
+
+        # Attendre que le reCAPTCHA + la navigation se fassent (peut prendre du temps)
+        try:
+            await self.page.wait_for_url("**/panel**", timeout=20000)
+            logger.info(f"Connecte (via reCAPTCHA): {email}")
+            return
         except PlaywrightTimeout:
             current_url = self.page.url
-            page_text = await self.page.text_content("body") or ""
-            await self._screenshot(f"login_failed_{email.split('@')[0]}")
-            if "login" in current_url or "Se connecter" in page_text:
-                raise Exception(f"Echec connexion pour {email} (identifiants invalides ?)")
-            logger.warning(f"Redirect inattendu apres login: {current_url}")
+            logger.info(f"URL apres click submit: {current_url}")
+
+        # Verifier si on est reste sur login (reCAPTCHA a peut-etre bloque)
+        if "/panel" not in self.page.url:
+            await self._screenshot(f"login_after_recaptcha_{email.split('@')[0]}")
+            logger.info("reCAPTCHA n'a pas abouti. Tentative submit natif (bypass reCAPTCHA)...")
+            
+            # Re-remplir les champs (le form peut avoir ete reset)
+            await self.page.evaluate(
+                """({email, password}) => {
+                jQuery('#emailLogin').val(email).trigger('input').trigger('change');
+                jQuery('#passwordLogin').val(password).trigger('input').trigger('change');
+            }""",
+                {"email": email, "password": password},
+            )
+            
+            # Methode 2: Submit natif pour bypass jQuery Validation + reCAPTCHA
+            submitted = await self.page.evaluate("""() => {
+                const form = document.getElementById('form-login');
+                if (!form) return false;
+                HTMLFormElement.prototype.submit.call(form);
+                return true;
+            }""")
+
+            if not submitted:
+                await self._screenshot(f"login_no_submit_{email.split('@')[0]}")
+                raise Exception(f"Impossible de soumettre le formulaire pour {email}")
+
+        # Attendre la navigation post-submit (le form POST vers /fr/login/authenticate)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeout:
+            logger.warning("Timeout en attendant networkidle apres submit")
+
+        # Verifier ou on a atterri
+        current_url = self.page.url
+        logger.info(f"URL apres soumission: {current_url}")
+
+        if "/panel" in current_url:
+            logger.info(f"Connecte: {email}")
+            return
+
+        # Si on n'est pas sur le panel, on est probablement redirige vers login
+        # ou bloque par reCAPTCHA. Prendre screenshot + dump HTML pour debug.
+        await self._screenshot(f"login_failed_{email.split('@')[0]}")
+
+        # Dump le HTML pour debug (titres, messages d'erreur)
+        debug_info = await self.page.evaluate("""() => {
+            const title = document.title;
+            const alerts = Array.from(document.querySelectorAll('.alert, .error, .help-block'))
+                .map(el => el.textContent.trim()).filter(Boolean);
+            const bodySnippet = document.body.innerText.substring(0, 500);
+            return {title, url: location.href, alerts, bodySnippet};
+        }""")
+        logger.info(f"Debug post-login: {json.dumps(debug_info, ensure_ascii=False)}")
+
+        if "login" in current_url or "authenticate" in current_url:
+            raise Exception(f"Echec connexion pour {email} - reCAPTCHA bloque ou identifiants invalides. URL: {current_url}")
+
+        # Si on est sur une autre page, c'est peut-etre un redirect intermediaire
+        logger.warning(f"Redirect inattendu apres login: {current_url}")
+        # Essayer de naviguer vers le panel
+        await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
+        if "/panel" not in self.page.url:
+            raise Exception(f"Impossible d'acceder au panel apres login. URL: {self.page.url}")
 
         logger.info(f"Connecte: {email}")
 
