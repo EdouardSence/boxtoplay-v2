@@ -171,6 +171,27 @@ class BoxToPlayWorker:
         self.page = await self.context.new_page()
         await stealth.apply_stealth_async(self.page)
 
+    async def _inject_cookies_raw(self, cookie_string):
+        """Injecte une chaine de cookies brute dans le contexte Playwright."""
+        cookie_objects = []
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            eq_idx = part.index("=")
+            name = part[:eq_idx].strip()
+            value = part[eq_idx + 1:].strip()
+            cookie_objects.append({
+                "name": name,
+                "value": value,
+                "domain": "www.boxtoplay.com",
+                "path": "/",
+                "httpOnly": name == "BOXTOPLAY_SESSION",
+                "secure": True,
+            })
+        if cookie_objects:
+            await self.context.add_cookies(cookie_objects)
+
     async def _screenshot(self, name):
         """Sauvegarde un screenshot pour debug."""
         try:
@@ -206,8 +227,8 @@ class BoxToPlayWorker:
 
         logger.info(f"Cookie string brute (debut): '{cookie_string[:80]}...' (len={len(cookie_string)})")
 
-        # Parser la chaine de cookies en objets Playwright
-        cookie_objects = []
+        # Parser la chaine de cookies en objets Playwright (dedup par nom, dernier gagne)
+        cookie_map = {}
         for part in cookie_string.split(";"):
             part = part.strip()
             if not part or "=" not in part:
@@ -215,14 +236,15 @@ class BoxToPlayWorker:
             eq_idx = part.index("=")
             name = part[:eq_idx].strip()
             value = part[eq_idx + 1:].strip()
-            cookie_objects.append({
+            cookie_map[name] = {
                 "name": name,
                 "value": value,
                 "domain": "www.boxtoplay.com",
                 "path": "/",
                 "httpOnly": name == "BOXTOPLAY_SESSION",
                 "secure": True,
-            })
+            }
+        cookie_objects = list(cookie_map.values())
 
         # Fallback: si aucun cookie parse, traiter comme token BOXTOPLAY_SESSION brut
         if not cookie_objects:
@@ -512,8 +534,12 @@ class BoxToPlayWorker:
         # Laisser le temps a l'installation de se propager
         await self.page.wait_for_timeout(5000)
 
-    async def start_server(self, server_id):
-        """Demarre le serveur avec retries en cas de 401/403."""
+    async def start_server(self, server_id, cookie_string=None):
+        """Demarre le serveur avec retries en cas de 401/403.
+        
+        Si cookie_string est fourni et qu'on recoit un 401/403, on re-injecte
+        les cookies originaux (rafraichis par le bot Discord) avant de retenter.
+        """
         for attempt in range(3):
             logger.info(f"Demarrage serveur {server_id} (tentative {attempt + 1}/3)...")
             response = await self.page.goto(
@@ -526,10 +552,17 @@ class BoxToPlayWorker:
                 logger.info(f"Serveur {server_id} demarre.")
                 return
             elif status in (401, 403) and attempt < 2:
-                logger.warning(f"Demarrage serveur: HTTP {status}, retry dans 5s...")
-                # Re-naviguer vers le panel pour rafraichir la session
-                await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
-                await self.page.wait_for_timeout(5000)
+                logger.warning(f"Demarrage serveur: HTTP {status}, re-injection cookies...")
+                # La session a expire cote serveur. Re-injecter les cookies originaux
+                # du Gist (le bot Discord les maintient frais)
+                if cookie_string:
+                    await self._new_session()
+                    await self._inject_cookies_raw(cookie_string)
+                    await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
+                    await self._solve_cloudflare()
+                else:
+                    await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
+                await self.page.wait_for_timeout(3000)
             else:
                 logger.warning(f"Demarrage serveur: HTTP {status}")
 
@@ -727,7 +760,7 @@ async def main():
         # =============================================
         logger.info("--- Phase 4: Demarrage et sauvegarde ---")
 
-        await worker.start_server(new_server_id)
+        await worker.start_server(new_server_id, cookie_string=target_cookies)
 
         # Recuperer les cookies frais pour le bot Discord
         cookie_string = await worker.get_cookies_string()
