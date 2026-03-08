@@ -251,7 +251,10 @@ class BoxToPlayWorker:
         current_url = self.page.url
         logger.info(f"URL apres injection cookies: {current_url}")
 
-        if "/panel" in current_url:
+        # Verifier qu'on est bien sur le panel (pas redirige vers login)
+        # Note: "login?redirect=/panel" contient "/panel" mais n'est PAS un succes
+        is_on_panel = "/panel" in current_url and "/login" not in current_url
+        if is_on_panel:
             logger.info(f"Connecte via cookies: {email}")
             await self._screenshot(f"login_ok_{email.split('@')[0]}")
             return
