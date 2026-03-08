@@ -8,23 +8,32 @@ on:
 jobs:
   migrate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y lftp
-          pip install requests beautifulsoup4
+          sudo apt-get update
+          sudo apt-get install -y lftp
 
-      - name: Run Worker HTTP
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run Worker
         env:
           GIST_ID: ${{ secrets.GIST_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           IP_NEW_SERVER: "orny"
+          MODPACK_VERSION_ID: "1521"
+          MODPACK_NAME: "Star Technology"
         run: python worker.py

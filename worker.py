@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+BoxToPlay Server Rotation Worker
+
+Utilise Playwright pour bypass Cloudflare et effectuer la rotation
+des serveurs Minecraft entre deux comptes BoxToPlay.
+
+Workflow:
+  1. Arreter l'ancien serveur (compte actif)
+  2. Acheter un nouveau serveur (compte cible)
+  3. Configurer DNS, FTP, modpack
+  4. Transferer le monde via lftp
+  5. Demarrer le nouveau serveur
+  6. Sauvegarder le state dans le Gist
+"""
 import os
 import json
 import time
 import shutil
 import logging
-import requests
+import asyncio
 import subprocess
-import re
-from bs4 import BeautifulSoup
-from datetime import datetime
+import requests
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_async
 
 # =============================================================================
 # CONFIGURATION
@@ -18,312 +32,625 @@ from datetime import datetime
 GIST_ID = os.environ.get("GIST_ID", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 IP_NEW_SERVER = os.environ.get("IP_NEW_SERVER", "orny")
-FTP_PASSWORD = os.environ.get("FTP_PASSWORD", "")
+FTP_PASSWORD = os.environ.get("FTP_PASSWORD", "Password123")
+MODPACK_VERSION_ID = os.environ.get("MODPACK_VERSION_ID", "1521")
+MODPACK_NAME = os.environ.get("MODPACK_NAME", "Star Technology")
 TEMP_DIR = "/tmp/boxtoplay_transfer"
 
-# Headers copiés de vos logs et fichiers
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Origin": "https://www.boxtoplay.com",
-    "Referer": "https://www.boxtoplay.com/panel"
+URLS = {
+    "login": "https://www.boxtoplay.com/fr/login",
+    "panel": "https://www.boxtoplay.com/panel",
+    "stop": "https://www.boxtoplay.com/minecraft/stop/{server_id}",
+    "start": "https://www.boxtoplay.com/minecraft/start/{server_id}",
+    "dns": "https://www.boxtoplay.com/minecraft/setServerDNS",
+    "cart_add": "https://www.boxtoplay.com/fr/cart/ajoutPanier/12?forceDuree=0",
+    "cart_basket": "https://www.boxtoplay.com/fr/cart/basket",
+    "cart_checkout": "https://www.boxtoplay.com/fr/cart/livraison",
+    "cart_remove": "https://www.boxtoplay.com/fr/cart/retirerPanier/0",
+    "ftp": "https://www.boxtoplay.com/minecraft/ftp/{server_id}",
+    "modpack": "https://www.boxtoplay.com/minecraft/modpacks/cursemodpacks/install/{server_id}?packVersionId={pack_id}&mapReset=true&pluginsReset=true",
+    "gist": "https://api.github.com/gists/{gist_id}",
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+CLOUDFLARE_TITLE = "Just a moment"
+CLOUDFLARE_TIMEOUT = 30000
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# SESSION HTTP
-# =============================================================================
-
-class BoxSession:
-    def __init__(self, cookies_dict=None):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        if cookies_dict:
-            # Nettoyage et injection du cookie
-            if "BOXTOPLAY_SESSION" in cookies_dict:
-                val = cookies_dict["BOXTOPLAY_SESSION"]
-                # Si le json contient toute la chaîne "BOXTOPLAY_SESSION=...", on coupe
-                if "=" in val:
-                    val = val.split("=")[-1]
-                self.session.cookies.set("BOXTOPLAY_SESSION", val, domain="www.boxtoplay.com")
-
-    def is_logged_in(self):
-        """Vérifie si la session est active en regardant le contenu de la page"""
-        try:
-            r = self.session.get("https://www.boxtoplay.com/panel", allow_redirects=False)
-            # Si redirection 302 vers login, c'est mort
-            if r.status_code == 302:
-                return False
-            # Vérification supplémentaire : Si on est redirigé vers /fr/login
-            if "login" in r.headers.get("Location", ""):
-                return False
-            # Si on a un code 200, on vérifie qu'on n'est pas sur la page de login déguisée
-            if "Se connecter" in r.text and "Mot de passe oublié" in r.text:
-                return False
-            return True
-        except Exception:
-            return False
-
-# =============================================================================
-# GIST UTILS
+# GIST STATE MANAGEMENT
 # =============================================================================
 
 def get_state():
+    """Charge le state depuis le Gist GitHub. Retourne (state, filename)."""
     headers = {"Authorization": f"token {GH_TOKEN}"}
-    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
+    r = requests.get(URLS["gist"].format(gist_id=GIST_ID), headers=headers)
     r.raise_for_status()
     files = r.json()["files"]
-    # On prend le premier fichier peu importe son nom
     filename = list(files.keys())[0]
-    return json.loads(files[filename]["content"])
+    state = json.loads(files[filename]["content"])
+    return state, filename
 
-def update_state(new_state):
+
+def update_state(new_state, filename):
+    """Sauvegarde le state dans le Gist GitHub."""
     headers = {"Authorization": f"token {GH_TOKEN}"}
-    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
-    filename = list(r.json()["files"].keys())[0]
     payload = {"files": {filename: {"content": json.dumps(new_state, indent=4)}}}
-    requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
-    logger.info("💾 État sauvegardé dans le Gist.")
+    r = requests.patch(URLS["gist"].format(gist_id=GIST_ID), headers=headers, json=payload)
+    r.raise_for_status()
+    logger.info("State sauvegarde dans le Gist.")
 
 # =============================================================================
-# ACTIONS BOXTOPLAY
+# BOXTOPLAY WORKER (Playwright)
 # =============================================================================
 
-def get_current_server_id(box: BoxSession):
-    """Scrape l'ID du serveur depuis le panel"""
-    r = box.session.get("https://www.boxtoplay.com/panel")
-    soup = BeautifulSoup(r.text, 'html.parser')
-    
-    # Sélecteur robuste basé sur votre historique
-    try:
-        # Cherche tous les blocs serveurs
-        blocks = soup.select('.block')
-        if not blocks: return None
-        
-        # Le dernier bloc est généralement le plus récent
-        last_block = blocks[-1]
-        link = last_block.select_one('h2 a strong')
-        if link:
-            return link.text.replace('#', '').strip()
-    except Exception:
-        pass
-    return None
+class BoxToPlayWorker:
+    """Automatise les interactions avec BoxToPlay via Playwright."""
 
-def stop_server(box: BoxSession, server_id):
-    logger.info(f"⏹️ Arrêt du serveur {server_id}...")
-    # GET simple suffisant
-    box.session.get(f"https://www.boxtoplay.com/minecraft/stop/{server_id}")
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
 
-def change_dns(box: BoxSession, server_id, dns_name):
-    logger.info(f"🔗 Changement DNS vers '{dns_name}'...")
-    url = "https://www.boxtoplay.com/minecraft/setServerDNS"
-    payload = {"name": "", "value": dns_name, "pk": server_id}
-    headers = {"X-Requested-With": "XMLHttpRequest"} # Important pour Ajax
-    box.session.post(url, data=payload, headers=headers)
+    async def start(self):
+        """Lance le navigateur Playwright avec stealth."""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        self.context = await self.browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=USER_AGENT,
+        )
+        self.page = await self.context.new_page()
+        await stealth_async(self.page)
+        logger.info("Navigateur Playwright lance.")
 
-def buy_server_safe(box: BoxSession):
-    """
-    Achète le serveur en vérifiant scrupuleusement le HTML du panier.
-    Basé sur le fichier boxtoplay.html fourni.
-    """
-    logger.info("🛒 Tentative ajout au panier...")
-    
-    # 1. Ajout au panier (GET)
-    box.session.get("https://www.boxtoplay.com/fr/cart/ajoutPanier/12?forceDuree=0")
-    
-    # 2. Analyse du Panier
-    logger.info("🔍 Analyse du panier...")
-    r = box.session.get("https://www.boxtoplay.com/fr/cart/basket")
-    soup = BeautifulSoup(r.text, 'html.parser')
-    
-    # Vérification Rupture de stock (Texte présent dans boxtoplay.html)
-    if "Rupture de stock" in r.text:
-        logger.error("❌ RUPTURE DE STOCK DÉTECTÉE. Abandon.")
-        empty_cart(box)
-        return False
+    async def close(self):
+        """Ferme le navigateur proprement."""
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+        logger.info("Navigateur ferme.")
 
-    # Vérification du Prix
-    # Dans boxtoplay.html, le total est dans le dernier div avec la classe .panier-summary-value
-    summary_values = soup.select(".panier-summary-value")
-    if not summary_values:
-        logger.error("❌ Impossible de lire le prix (Structure HTML changée ?). Abandon.")
-        empty_cart(box)
-        return False
-    
-    # Le dernier élément est le "Reste à payer"
-    total_text = summary_values[-1].text.strip() # ex: "29.99 €" ou "0.00 €"
-    logger.info(f"💰 Montant détecté : {total_text}")
-    
-    # Nettoyage du prix pour conversion float
-    price_clean = total_text.replace('€', '').replace(' ', '').replace(',', '.')
-    
-    try:
-        price = float(price_clean)
-        if price > 0.00:
-            logger.error(f"❌ PANIER PAYANT ({price} €) ! ABANDON IMMÉDIAT.")
-            empty_cart(box)
+    async def _solve_cloudflare(self):
+        """Attend que le challenge Cloudflare soit resolu."""
+        title = await self.page.title()
+        if CLOUDFLARE_TITLE not in title:
+            return
+
+        logger.info("Challenge Cloudflare detecte, attente...")
+        try:
+            await self.page.wait_for_function(
+                "() => !document.title.includes('Just a moment')",
+                timeout=CLOUDFLARE_TIMEOUT,
+            )
+            await self.page.wait_for_timeout(3000)
+        except PlaywrightTimeout:
+            raise Exception("Cloudflare challenge non resolu (timeout 30s)")
+
+        final_title = await self.page.title()
+        if CLOUDFLARE_TITLE in final_title:
+            raise Exception(f"Cloudflare toujours present: {final_title}")
+        logger.info(f"Cloudflare resolu. Page: {final_title}")
+
+    async def _new_session(self):
+        """Cree une nouvelle page (utile pour changer de compte)."""
+        if self.page:
+            await self.page.close()
+        # Vider tous les cookies pour une session propre
+        await self.context.clear_cookies()
+        self.page = await self.context.new_page()
+        await stealth_async(self.page)
+
+    # ----- Actions BoxToPlay -----
+
+    async def login(self, email, password):
+        """Se connecte a BoxToPlay avec email/mot de passe."""
+        logger.info(f"Connexion: {email}...")
+
+        await self.page.goto(URLS["login"], wait_until="networkidle", timeout=60000)
+        await self._solve_cloudflare()
+
+        # Remplir le formulaire de login
+        # BoxToPlay utilise _username/_password ou email/password selon la version
+        email_input = self.page.locator(
+            'input[name="_username"], input[name="email"], input[type="email"]'
+        ).first
+        password_input = self.page.locator(
+            'input[name="_password"], input[name="password"], input[type="password"]'
+        ).first
+
+        await email_input.fill(email)
+        await password_input.fill(password)
+
+        # Soumettre
+        submit_btn = self.page.locator(
+            'button[type="submit"], input[type="submit"]'
+        ).first
+        await submit_btn.click()
+
+        # Attendre la redirection vers le panel
+        try:
+            await self.page.wait_for_url("**/panel**", timeout=15000)
+        except PlaywrightTimeout:
+            current_url = self.page.url
+            page_text = await self.page.text_content("body") or ""
+            if "login" in current_url or "Se connecter" in page_text:
+                raise Exception(f"Echec connexion pour {email} (identifiants invalides ?)")
+            logger.warning(f"Redirect inattendu apres login: {current_url}")
+
+        logger.info(f"Connecte: {email}")
+
+    async def get_server_id(self):
+        """Recupere l'ID du serveur depuis le panel."""
+        await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=30000)
+        await self._solve_cloudflare()
+
+        server_id = await self.page.evaluate("""() => {
+            // Methode 1: blocs .block avec h2 > a > strong (#ID)
+            const blocks = document.querySelectorAll('.block');
+            if (blocks.length > 0) {
+                const lastBlock = blocks[blocks.length - 1];
+                const strong = lastBlock.querySelector('h2 a strong');
+                if (strong) {
+                    return strong.textContent.replace('#', '').trim();
+                }
+            }
+            // Methode 2: liens contenant /minecraft/
+            const links = document.querySelectorAll('a[href*="/minecraft/"]');
+            for (const link of links) {
+                const match = link.href.match(/\\/minecraft\\/\\w+\\/(\\d+)/);
+                if (match) return match[1];
+            }
+            // Methode 3: texte "Serveur #XXXX"
+            const body = document.body.textContent;
+            const match = body.match(/Serveur\\s*#(\\d+)/i);
+            if (match) return match[1];
+            return null;
+        }""")
+
+        if server_id:
+            logger.info(f"Server ID: {server_id}")
+        else:
+            logger.warning("Aucun serveur trouve sur le panel.")
+        return server_id
+
+    async def stop_server(self, server_id):
+        """Arrete le serveur."""
+        logger.info(f"Arret serveur {server_id}...")
+        response = await self.page.goto(
+            URLS["stop"].format(server_id=server_id),
+            wait_until="networkidle",
+            timeout=30000,
+        )
+        status = response.status if response else 0
+        if status == 200:
+            logger.info(f"Serveur {server_id} arrete.")
+        else:
+            logger.warning(f"Arret serveur: HTTP {status}")
+
+    async def change_dns(self, server_id, dns_name):
+        """Change le DNS du serveur via appel AJAX."""
+        logger.info(f"Changement DNS -> '{dns_name}'...")
+
+        # S'assurer qu'on est sur le bon domaine pour le fetch
+        if "boxtoplay.com" not in self.page.url:
+            await self.page.goto(URLS["panel"], wait_until="networkidle", timeout=15000)
+
+        result = await self.page.evaluate(
+            """async ({server_id, dns_name}) => {
+            try {
+                const response = await fetch('/minecraft/setServerDNS', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: 'name=&value=' + encodeURIComponent(dns_name) + '&pk=' + server_id
+                });
+                return {status: response.status, ok: response.ok};
+            } catch (e) {
+                return {status: 0, error: e.message};
+            }
+        }""",
+            {"server_id": str(server_id), "dns_name": dns_name},
+        )
+
+        if result.get("ok"):
+            logger.info(f"DNS mis a jour: '{dns_name}'")
+        else:
+            logger.warning(f"DNS: HTTP {result.get('status')} - {result.get('error', '')}")
+
+    async def empty_cart(self):
+        """Vide le panier."""
+        logger.info("Vidage du panier...")
+        await self.page.goto(URLS["cart_remove"], wait_until="networkidle", timeout=15000)
+
+    async def buy_server(self):
+        """Achete un serveur gratuit avec verification stricte du prix."""
+        logger.info("--- Achat serveur ---")
+
+        # 1. Ajouter au panier
+        logger.info("Ajout au panier...")
+        await self.page.goto(URLS["cart_add"], wait_until="networkidle", timeout=30000)
+        await self._solve_cloudflare()
+
+        # 2. Verifier le panier
+        logger.info("Verification du panier...")
+        await self.page.goto(URLS["cart_basket"], wait_until="networkidle", timeout=30000)
+
+        page_text = await self.page.text_content("body") or ""
+
+        # Verifier rupture de stock
+        if "Rupture de stock" in page_text:
+            logger.error("RUPTURE DE STOCK. Abandon.")
+            await self.empty_cart()
             return False
-    except ValueError:
-        logger.error(f"❌ Erreur conversion prix. Sécurité activée. Abandon.")
-        empty_cart(box)
-        return False
-        
-    # 3. Validation (Si gratuit uniquement)
-    logger.info("✅ Panier gratuit valide. Confirmation...")
-    
-    # URL AJAX trouvée dans le script de boxtoplay.html : $.ajax({ url: "/fr/cart/livraison", type: "POST" })
-    # Headers Ajax nécessaires
-    headers = {"X-Requested-With": "XMLHttpRequest"}
-    res = box.session.post("https://www.boxtoplay.com/fr/cart/livraison", headers=headers)
-    
-    # Si succès, boxtoplay renvoie souvent du HTML partiel ou redirige
-    if res.status_code == 200:
-        logger.info("🎉 Commande envoyée ! Attente de création...")
-        time.sleep(15) 
+
+        # Verifier le prix
+        price_text = await self.page.evaluate("""() => {
+            const values = document.querySelectorAll('.panier-summary-value');
+            if (values.length > 0) {
+                return values[values.length - 1].textContent.trim();
+            }
+            return null;
+        }""")
+
+        if not price_text:
+            logger.error("Impossible de lire le prix (structure HTML changee ?). Abandon.")
+            await self.empty_cart()
+            return False
+
+        logger.info(f"Montant detecte: {price_text}")
+
+        price_clean = price_text.replace("€", "").replace(" ", "").replace(",", ".").strip()
+        try:
+            price = float(price_clean)
+            if price > 0.00:
+                logger.error(f"PANIER PAYANT ({price} EUR). ABANDON IMMEDIAT.")
+                await self.empty_cart()
+                return False
+        except ValueError:
+            logger.error(f"Erreur conversion prix '{price_clean}'. Abandon.")
+            await self.empty_cart()
+            return False
+
+        # 3. Valider la commande
+        logger.info("Panier gratuit confirme. Validation de la commande...")
+
+        result = await self.page.evaluate("""async () => {
+            try {
+                const response = await fetch('/fr/cart/livraison', {
+                    method: 'POST',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                return {status: response.status, ok: response.ok};
+            } catch (e) {
+                return {status: 0, error: e.message};
+            }
+        }""")
+
+        if result.get("status") == 200:
+            logger.info("Commande validee ! Attente de creation du serveur (15s)...")
+            await self.page.wait_for_timeout(15000)
+            return True
+        else:
+            logger.error(f"Erreur validation: {result}")
+            return False
+
+    async def create_ftp_account(self, server_id, password):
+        """Cree un compte FTP sur le serveur."""
+        logger.info(f"Creation compte FTP (serveur {server_id})...")
+
+        ftp_user = f"user_{int(time.time())}"
+        url = URLS["ftp"].format(server_id=server_id)
+
+        await self.page.goto(url, wait_until="networkidle", timeout=30000)
+        await self._solve_cloudflare()
+
+        # Remplir le formulaire FTP
+        try:
+            username_input = self.page.locator('input[name="username"]').first
+            password_input = self.page.locator('input[name="password"]').first
+
+            await username_input.fill(ftp_user)
+            await password_input.fill(password)
+
+            submit = self.page.locator(
+                'button[type="submit"], input[type="submit"]'
+            ).first
+            await submit.click()
+            await self.page.wait_for_load_state("networkidle")
+        except Exception as e:
+            logger.warning(f"Formulaire FTP non trouve, tentative POST direct: {e}")
+            await self.page.evaluate(
+                """async ({server_id, user, password}) => {
+                const formData = new URLSearchParams();
+                formData.append('username', user);
+                formData.append('password', password);
+                formData.append('action', 'create');
+                await fetch('/minecraft/ftp/' + server_id, {
+                    method: 'POST',
+                    body: formData
+                });
+            }""",
+                {"server_id": str(server_id), "user": ftp_user, "password": password},
+            )
+            await self.page.wait_for_timeout(3000)
+
+        # Recharger la page pour recuperer le host FTP
+        await self.page.goto(url, wait_until="networkidle", timeout=15000)
+
+        host = await self.page.evaluate("""() => {
+            const cells = document.querySelectorAll('table td');
+            for (const cell of cells) {
+                const text = cell.textContent.trim();
+                if (text.includes('ftp.') || text.includes('mc-')) {
+                    return text;
+                }
+            }
+            return null;
+        }""")
+
+        if not host:
+            host = "ftp.boxtoplay.com"
+            logger.warning(f"Host FTP non detecte, fallback: {host}")
+
+        logger.info(f"Compte FTP cree: {ftp_user}@{host}")
+        return {"host": host, "user": ftp_user, "password": password}
+
+    async def install_modpack(self, server_id, pack_version_id=None):
+        """Installe un modpack CurseForge sur le serveur."""
+        pack_id = pack_version_id or MODPACK_VERSION_ID
+        logger.info(f"Installation modpack (packVersionId={pack_id})...")
+
+        url = URLS["modpack"].format(server_id=server_id, pack_id=pack_id)
+        response = await self.page.goto(url, wait_until="networkidle", timeout=60000)
+
+        status = response.status if response else 0
+        if status == 200:
+            logger.info("Modpack installe.")
+        else:
+            logger.warning(f"Installation modpack: HTTP {status}")
+
+        # Laisser le temps a l'installation de se propager
+        await self.page.wait_for_timeout(5000)
+
+    async def start_server(self, server_id):
+        """Demarre le serveur."""
+        logger.info(f"Demarrage serveur {server_id}...")
+        response = await self.page.goto(
+            URLS["start"].format(server_id=server_id),
+            wait_until="networkidle",
+            timeout=30000,
+        )
+        status = response.status if response else 0
+        if status == 200:
+            logger.info(f"Serveur {server_id} demarre.")
+        else:
+            logger.warning(f"Demarrage serveur: HTTP {status}")
+
+    async def get_cookies_string(self):
+        """Recupere les cookies du navigateur au format chaine pour le Gist."""
+        cookies = await self.context.cookies("https://www.boxtoplay.com")
+        relevant_names = [
+            "BOXTOPLAY_SESSION",
+            "BOXTOPLAY_LANG",
+            "cf_clearance",
+            "cookie_consent_level",
+            "cookie_consent_user_accepted",
+            "cookie_consent_user_consent_token",
+        ]
+        relevant = [c for c in cookies if c["name"] in relevant_names]
+        return "; ".join(f'{c["name"]}={c["value"]}' for c in relevant)
+
+
+# =============================================================================
+# FTP TRANSFER
+# =============================================================================
+
+def run_lftp(args, timeout=900):
+    """Execute une commande lftp avec timeout."""
+    try:
+        result = subprocess.run(
+            ["lftp"] + args,
+            check=True,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout:
+            logger.info(f"lftp stdout: {result.stdout[:500]}")
         return True
-    else:
-        logger.error(f"❌ Erreur validation: {res.status_code}")
+    except subprocess.TimeoutExpired:
+        logger.error("lftp: timeout depasse (15 min)")
+        return False
+    except subprocess.CalledProcessError as e:
+        logger.error(f"lftp erreur: {e.stderr[:500] if e.stderr else str(e)}")
+        return False
+    except FileNotFoundError:
+        logger.error("lftp non installe. Transfert impossible.")
         return False
 
-def empty_cart(box: BoxSession):
-    logger.info("🗑️ Vidage panier...")
-    # URL de suppression standard
-    box.session.get("https://www.boxtoplay.com/fr/cart/retirerPanier/0")
 
-def create_ftp_account(box: BoxSession, server_id, password):
-    logger.info("📁 Création compte FTP...")
-    url = f"https://www.boxtoplay.com/minecraft/ftp/{server_id}"
-    
-    ftp_user = f"user_{int(time.time())}"
-    # Payload standard pour ce formulaire
-    payload = {
-        "username": ftp_user,
-        "password": password,
-        "action": "create" # Souvent requis
-    }
-    
-    box.session.post(url, data=payload)
-    
-    # Récupération du host
-    r = box.session.get(url)
-    soup = BeautifulSoup(r.text, 'html.parser')
-    try:
-        # Tableau FTP, 2ème colonne
-        host = soup.select_one('table tbody tr:nth-of-type(2) td:nth-of-type(2)').text.strip()
-    except:
-        host = "ftp.boxtoplay.com"
-        
-    return {"host": host, "user": ftp_user, "password": password}
+def transfer_world(source_ftp, target_ftp):
+    """Transfere le dossier /world de l'ancien serveur vers le nouveau via lftp."""
+    if not source_ftp or not source_ftp.get("host"):
+        logger.warning("Pas d'infos FTP source. Transfert ignore.")
+        return False
 
-def install_modpack(box: BoxSession, server_id):
-    logger.info("📦 Installation Modpack...")
-    url = f"https://www.boxtoplay.com/minecraft/modpacks/cursemodpacks/install/{server_id}?packVersionId=10517&mapReset=true&pluginsReset=true"
-    box.session.get(url)
+    if not target_ftp or not target_ftp.get("host"):
+        logger.warning("Pas d'infos FTP cible. Transfert ignore.")
+        return False
 
-def start_server(box: BoxSession, server_id):
-    logger.info("▶️ Démarrage...")
-    box.session.get(f"https://www.boxtoplay.com/minecraft/start/{server_id}")
-
-# =============================================================================
-# TRANSFERT
-# =============================================================================
-
-def run_lftp(args):
-    try:
-        subprocess.run(['lftp'] + args, check=True, timeout=900)
-    except Exception as e:
-        logger.error(f"Erreur LFTP: {e}")
-
-def transfer_world(source, target):
-    if not source or not source.get('host'): return
     os.makedirs(TEMP_DIR, exist_ok=True)
-    local = os.path.join(TEMP_DIR, "world")
-    
-    logger.info("📥 Téléchargement...")
-    # --delete permet de nettoyer le dossier local si besoin, mirror simple suffit ici
-    run_lftp(['-u', f"{source['user']},{source['password']}", f"ftp://{source['host']}", 
-              '-e', f"mirror --verbose --parallel=10 /world {local}; quit"])
-              
-    logger.info("📤 Envoi...")
-    run_lftp(['-u', f"{target['user']},{target['password']}", f"ftp://{target['host']}",
-              '-e', f"mirror --reverse --verbose --parallel=10 {local} /world; quit"])
-              
+    local_world = os.path.join(TEMP_DIR, "world")
+
+    # Telecharger le monde depuis l'ancien serveur
+    logger.info(f"Telechargement /world depuis {source_ftp['host']}...")
+    dl_ok = run_lftp([
+        "-u", f"{source_ftp['user']},{source_ftp['password']}",
+        f"ftp://{source_ftp['host']}",
+        "-e", f"mirror --verbose --parallel=10 /world {local_world}; quit",
+    ])
+
+    if not dl_ok or not os.path.exists(local_world):
+        logger.warning("Telechargement echoue ou /world vide.")
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        return False
+
+    # Uploader le monde vers le nouveau serveur
+    logger.info(f"Upload /world vers {target_ftp['host']}...")
+    ul_ok = run_lftp([
+        "-u", f"{target_ftp['user']},{target_ftp['password']}",
+        f"ftp://{target_ftp['host']}",
+        "-e", f"mirror --reverse --verbose --parallel=10 {local_world} /world; quit",
+    ])
+
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
+    if ul_ok:
+        logger.info("Transfert de monde termine.")
+    else:
+        logger.warning("Upload du monde echoue.")
+    return ul_ok
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def main():
-    logger.info("🚀 WORKER START")
-    state = get_state()
-    
+async def main():
+    logger.info("=" * 50)
+    logger.info("BOXTOPLAY WORKER START")
+    logger.info("=" * 50)
+
+    # Validation
+    if not GIST_ID or not GH_TOKEN:
+        raise Exception("GIST_ID et GH_TOKEN requis (variables d'environnement).")
+
+    # 1. Charger le state
+    state, gist_filename = get_state()
     current_idx = state.get("active_account_index", 0)
     next_idx = 1 if current_idx == 0 else 0
-    
+
     acc_active = state["accounts"][current_idx]
     acc_target = state["accounts"][next_idx]
-    common_pass = state.get("ftp_password", "Password123")
-    
-    # 1. Check Active Account
-    logger.info(f"🔄 Check compte actif : {acc_active['email']}")
-    box_active = BoxSession(acc_active.get("cookies"))
-    
+    common_pass = state.get("ftp_password", FTP_PASSWORD)
+
+    logger.info(f"Compte actif:  [{current_idx}] {acc_active['email']}")
+    logger.info(f"Compte cible:  [{next_idx}] {acc_target['email']}")
+
+    # Infos FTP du serveur actuel (pour le transfert de monde)
     ftp_source = {
         "host": acc_active.get("ftp_host"),
         "user": acc_active.get("ftp_user"),
-        "password": common_pass
+        "password": common_pass,
     }
-    
-    if box_active.is_logged_in():
-        srv_id = get_current_server_id(box_active)
-        if srv_id:
-            change_dns(box_active, srv_id, "")
-            stop_server(box_active, srv_id)
-    else:
-        logger.warning("⚠️ Session active expirée. Impossible d'arrêter proprement.")
 
-    # 2. Activate Target Account
-    logger.info(f"🎯 Activation compte cible : {acc_target['email']}")
-    box_target = BoxSession(acc_target.get("cookies"))
-    
-    if not box_target.is_logged_in():
-        # C'est ici que ça plante. Le bot doit empêcher ça.
-        raise Exception("❌ CRITIQUE : Session cible expirée. Mettez à jour le Gist manuellement !")
-        
-    if not buy_server_safe(box_target):
-        logger.warning("⚠️ Achat non réalisé (Pas de stock ou déjà présent).")
-        
-    srv_id_target = None
-    for _ in range(5):
-        srv_id_target = get_current_server_id(box_target)
-        if srv_id_target: break
-        time.sleep(2)
-        
-    if not srv_id_target:
-        raise Exception("❌ Serveur introuvable après achat.")
-        
-    change_dns(box_target, srv_id_target, IP_NEW_SERVER)
-    ftp_target = create_ftp_account(box_target, srv_id_target, common_pass)
-    install_modpack(box_target, srv_id_target)
-    
-    # 3. Transfer & Start
-    transfer_world(ftp_source, ftp_target)
-    start_server(box_target, srv_id_target)
-    
-    # 4. Save
-    state["active_account_index"] = next_idx
-    state["current_server_id"] = srv_id_target
-    state["accounts"][next_idx]["ftp_host"] = ftp_target["host"]
-    state["accounts"][next_idx]["ftp_user"] = ftp_target["user"]
-    # On ne met à jour les cookies QUE si le serveur en a renvoyé de nouveaux dans les headers
-    # Requests le gère automatiquement via session.cookies
-    state["accounts"][next_idx]["cookies"] = box_target.session.cookies.get_dict()
-    
-    update_state(state)
-    logger.info("✅ SUCCESS")
+    worker = BoxToPlayWorker()
+
+    try:
+        await worker.start()
+
+        # =============================================
+        # Phase 1: Arreter l'ancien serveur
+        # =============================================
+        logger.info("--- Phase 1: Arret de l'ancien serveur ---")
+
+        try:
+            await worker.login(acc_active["email"], acc_active["password"])
+
+            server_id = await worker.get_server_id()
+            if server_id:
+                await worker.change_dns(server_id, "")
+                await worker.stop_server(server_id)
+                logger.info(f"Ancien serveur {server_id} arrete, DNS libere.")
+            else:
+                logger.warning("Aucun serveur actif (probablement deja expire).")
+        except Exception as e:
+            logger.warning(f"Phase 1 echouee (non bloquant): {e}")
+
+        # =============================================
+        # Phase 2: Creer le nouveau serveur
+        # =============================================
+        logger.info("--- Phase 2: Creation du nouveau serveur ---")
+
+        # Nouvelle session navigateur pour le second compte
+        await worker._new_session()
+        await worker.login(acc_target["email"], acc_target["password"])
+
+        # Acheter le serveur gratuit
+        if not await worker.buy_server():
+            raise Exception("Achat du serveur echoue (rupture de stock ou panier payant).")
+
+        # Recuperer l'ID du nouveau serveur (avec retries)
+        new_server_id = None
+        for attempt in range(6):
+            new_server_id = await worker.get_server_id()
+            if new_server_id:
+                break
+            logger.info(f"Serveur pas encore disponible, retry {attempt + 1}/6...")
+            await worker.page.wait_for_timeout(5000)
+
+        if not new_server_id:
+            raise Exception("Serveur introuvable apres achat.")
+
+        logger.info(f"Nouveau serveur: #{new_server_id}")
+
+        # Configurer le serveur
+        await worker.change_dns(new_server_id, IP_NEW_SERVER)
+        ftp_target = await worker.create_ftp_account(new_server_id, common_pass)
+        await worker.install_modpack(new_server_id)
+
+        # =============================================
+        # Phase 3: Transfert de monde
+        # =============================================
+        logger.info("--- Phase 3: Transfert de monde ---")
+        transfer_world(ftp_source, ftp_target)
+
+        # =============================================
+        # Phase 4: Demarrer et sauvegarder
+        # =============================================
+        logger.info("--- Phase 4: Demarrage et sauvegarde ---")
+
+        await worker.start_server(new_server_id)
+
+        # Recuperer les cookies frais pour le bot Discord
+        cookie_string = await worker.get_cookies_string()
+
+        # Mettre a jour le state
+        state["active_account_index"] = next_idx
+        state["current_server_id"] = new_server_id
+        state["modpack"] = MODPACK_NAME
+        state["accounts"][next_idx]["server_id"] = new_server_id
+        state["accounts"][next_idx]["ftp_host"] = ftp_target["host"]
+        state["accounts"][next_idx]["ftp_user"] = ftp_target["user"]
+        state["accounts"][next_idx]["cookies"] = {"BOXTOPLAY_SESSION": cookie_string}
+
+        update_state(state, gist_filename)
+
+        logger.info("=" * 50)
+        logger.info("BOXTOPLAY WORKER SUCCESS")
+        logger.info("=" * 50)
+
+    except Exception as e:
+        logger.error(f"WORKER FAILED: {e}")
+        raise
+    finally:
+        await worker.close()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -1,6 +1,6 @@
-# BoxToPlay Worker - Dépendances Python
-# Compatible GitHub Codespaces
+# BoxToPlay Worker - Python dependencies
+# For GitHub Actions (ubuntu-latest)
 
 requests
-beautifulsoup4
-lftp
+playwright
+playwright-stealth
