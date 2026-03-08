@@ -36,6 +36,7 @@ FTP_PASSWORD = os.environ.get("FTP_PASSWORD", "Password123")
 MODPACK_VERSION_ID = os.environ.get("MODPACK_VERSION_ID", "1521")
 MODPACK_NAME = os.environ.get("MODPACK_NAME", "Star Technology")
 TEMP_DIR = "/tmp/boxtoplay_transfer"
+SCREENSHOT_DIR = "/tmp/boxtoplay_screenshots"
 
 URLS = {
     "login": "https://www.boxtoplay.com/fr/login",
@@ -139,10 +140,12 @@ class BoxToPlayWorker:
             )
             await self.page.wait_for_timeout(3000)
         except PlaywrightTimeout:
+            await self._screenshot("cloudflare_timeout")
             raise Exception("Cloudflare challenge non resolu (timeout 30s)")
 
         final_title = await self.page.title()
         if CLOUDFLARE_TITLE in final_title:
+            await self._screenshot("cloudflare_stuck")
             raise Exception(f"Cloudflare toujours present: {final_title}")
         logger.info(f"Cloudflare resolu. Page: {final_title}")
 
@@ -155,6 +158,16 @@ class BoxToPlayWorker:
         self.page = await self.context.new_page()
         await stealth.apply_stealth_async(self.page)
 
+    async def _screenshot(self, name):
+        """Sauvegarde un screenshot pour debug."""
+        try:
+            os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+            path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
+            await self.page.screenshot(path=path, full_page=True)
+            logger.info(f"Screenshot sauve: {path}")
+        except Exception as e:
+            logger.warning(f"Screenshot echoue: {e}")
+
     # ----- Actions BoxToPlay -----
 
     async def login(self, email, password):
@@ -164,6 +177,26 @@ class BoxToPlayWorker:
         await self.page.goto(URLS["login"], wait_until="networkidle", timeout=60000)
         await self._solve_cloudflare()
 
+        # Screenshot apres chargement pour debug
+        await self._screenshot(f"login_loaded_{email.split('@')[0]}")
+
+        # Fermer les overlays potentiels (cookie consent, popups)
+        for selector in [
+            'button:has-text("Accepter")',
+            'button:has-text("Accept")',
+            'button:has-text("OK")',
+            '.cookie-consent-accept',
+            '[data-dismiss="modal"]',
+        ]:
+            try:
+                btn = self.page.locator(selector).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    logger.info(f"Overlay ferme: {selector}")
+                    await self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
         # Remplir le formulaire de login
         # BoxToPlay utilise _username/_password ou email/password selon la version
         email_input = self.page.locator(
@@ -172,6 +205,20 @@ class BoxToPlayWorker:
         password_input = self.page.locator(
             'input[name="_password"], input[name="password"], input[type="password"]'
         ).first
+
+        # Attendre que l'input soit visible (max 10s)
+        try:
+            await email_input.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeout:
+            await self._screenshot(f"login_input_not_visible_{email.split('@')[0]}")
+            # Essayer de scroller vers l'element
+            try:
+                await email_input.scroll_into_view_if_needed()
+                await self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            # Tenter quand meme si ca echoue
+            logger.warning("Input email non visible apres 10s, tentative quand meme...")
 
         await email_input.fill(email)
         await password_input.fill(password)
@@ -188,6 +235,7 @@ class BoxToPlayWorker:
         except PlaywrightTimeout:
             current_url = self.page.url
             page_text = await self.page.text_content("body") or ""
+            await self._screenshot(f"login_failed_{email.split('@')[0]}")
             if "login" in current_url or "Se connecter" in page_text:
                 raise Exception(f"Echec connexion pour {email} (identifiants invalides ?)")
             logger.warning(f"Redirect inattendu apres login: {current_url}")
