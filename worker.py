@@ -23,7 +23,7 @@ import asyncio
 import subprocess
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 
 # =============================================================================
 # CONFIGURATION
@@ -55,6 +55,8 @@ URLS = {
 CLOUDFLARE_TITLE = "Just a moment"
 CLOUDFLARE_TIMEOUT = 30000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+stealth = Stealth()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -112,7 +114,7 @@ class BoxToPlayWorker:
             user_agent=USER_AGENT,
         )
         self.page = await self.context.new_page()
-        await stealth_async(self.page)
+        await stealth.apply_stealth_async(self.page)
         logger.info("Navigateur Playwright lance.")
 
     async def close(self):
@@ -151,7 +153,7 @@ class BoxToPlayWorker:
         # Vider tous les cookies pour une session propre
         await self.context.clear_cookies()
         self.page = await self.context.new_page()
-        await stealth_async(self.page)
+        await stealth.apply_stealth_async(self.page)
 
     # ----- Actions BoxToPlay -----
 
