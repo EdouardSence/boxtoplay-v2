@@ -73,7 +73,20 @@ def get_state():
     r.raise_for_status()
     files = r.json()["files"]
     filename = list(files.keys())[0]
-    state = json.loads(files[filename]["content"])
+    logger.info(f"Gist filename: {filename}")
+    raw_content = files[filename]["content"]
+    logger.info(f"Gist content length: {len(raw_content)} chars")
+    state = json.loads(raw_content)
+    # Log cookie format for each account (first 80 chars only)
+    for i, acc in enumerate(state.get("accounts", [])):
+        cs = acc.get("cookies", {}).get("BOXTOPLAY_SESSION", "")
+        has_eq = "=" in cs if cs else False
+        has_semi = ";" in cs if cs else False
+        logger.info(
+            f"Account[{i}] {acc.get('email', '?')}: cookie len={len(cs)}, "
+            f"has '='={has_eq}, has ';'={has_semi}, "
+            f"preview='{cs[:80]}...'" if cs else f"Account[{i}]: NO COOKIES"
+        )
     return state, filename
 
 
@@ -176,15 +189,22 @@ class BoxToPlayWorker:
         Le bot Discord (boxtoplay-bot) maintient les cookies frais via Puppeteer.
         Le worker les injecte dans Playwright pour eviter le reCAPTCHA du login.
         
+        Format attendu (ecrit par le bot):
+            "BOXTOPLAY_LANG=en; cf_clearance=xxx; BOXTOPLAY_SESSION=xxx; ..."
+        
+        Fallback: si la chaine est un token brut (pas de "="), on l'utilise
+        comme valeur BOXTOPLAY_SESSION directement.
+        
         Args:
             email: L'email du compte (pour logging)
-            cookie_string: La chaine de cookies "name=value; name=value; ..."
-                           stockee dans le Gist sous accounts[i].cookies.BOXTOPLAY_SESSION
+            cookie_string: La chaine de cookies stockee dans le Gist
         """
         logger.info(f"Injection cookies pour: {email}...")
 
         if not cookie_string or not cookie_string.strip():
             raise Exception(f"Pas de cookies dans le Gist pour {email}. Le bot Discord doit les rafraichir d'abord.")
+
+        logger.info(f"Cookie string brute (debut): '{cookie_string[:80]}...' (len={len(cookie_string)})")
 
         # Parser la chaine de cookies en objets Playwright
         cookie_objects = []
@@ -204,8 +224,20 @@ class BoxToPlayWorker:
                 "secure": True,
             })
 
+        # Fallback: si aucun cookie parse, traiter comme token BOXTOPLAY_SESSION brut
         if not cookie_objects:
-            raise Exception(f"Cookie string vide ou invalide pour {email}: '{cookie_string[:50]}...'")
+            logger.warning(
+                f"Format cookie non standard pour {email} (pas de 'name=value'). "
+                f"Utilisation comme token BOXTOPLAY_SESSION brut."
+            )
+            cookie_objects.append({
+                "name": "BOXTOPLAY_SESSION",
+                "value": cookie_string.strip(),
+                "domain": "www.boxtoplay.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+            })
 
         logger.info(f"Injection de {len(cookie_objects)} cookies: {[c['name'] for c in cookie_objects]}")
 
